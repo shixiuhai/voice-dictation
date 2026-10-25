@@ -7,11 +7,28 @@
 
 ---
 
-## 一、先回答两个问题
+## 一、现在就能用（当前这台 WSL2）
 
-### 1. 这台机器能访问麦克风吗？
+```sh
+cd voice-dictation
 
-**不能。** 这是 WSL2（`6.18.54.1-microsoft-standard-WSL2`），内核里没有音频驱动：
+# ① 听写仓库自带的测试音频
+python3 dictation.py --file samples/1.wav
+
+# ② 抓 Windows 会话的音频来听写（WSLg 的 RDP 采集源）
+python3 dictation.py --source pulse --device RDPSource
+
+# ③ 让 Windows 那边的麦克风推过来（WSL2 的 localhost 转发默认开着）
+#    WSL2 侧：python3 dictation.py --source tcp --port 8765
+#    Windows 侧：pip install sounddevice numpy
+#                python scripts/send_mic.py --host 127.0.0.1 --port 8765
+```
+
+听写记录落在 `transcripts/`，实时输出打在终端上（灰色 `…` 是正在说的半句）。
+
+### 为什么没有「直接开麦」这一步
+
+**这台机器没有麦克风设备**，这是内核层面的事，开关是打不开的：
 
 ```
 $ ls /dev/snd
@@ -21,22 +38,43 @@ $ ls /proc/asound
 ls: cannot access '/proc/asound': No such file or directory
 ```
 
-WSLg 的 PulseAudio 桥是通的（`/mnt/wslg/runtime-dir/pulse/native` 有 socket，
-`pulseaudio.log` 里 rdp-sink 已连接），但它只提供**输出**：
-Linux 侧放声音给 Windows，没有把 Windows 麦克风送进 Linux 的通道。
-所以 `--source mic` 在这台机器上必然失败——程序会直接告诉你原因，而不是抛一屏 ALSA 报错。
+WSL2 不把宿主机的声卡透传进内核，所以没有 ALSA 采集设备，也没有 `/dev/snd` 的 `capture` 节点。
+WSLg 的 PulseAudio 桥是通的，但**只解决输出**（Linux 放声音给 Windows）。
 
-### 2. 那这程序怎么用？
+不过 WSLg 的 Pulse 服务端其实带了一个**采集源** `RDPSource`（`module-rdp-source`），
+能抓到 Windows 会话的音频流（Windows 侧开麦重定向的话，麦克风也在里面）：
 
-三种绕开本机麦克风的办法，都实测跑通了：
+```
+$ pactl list short sources
+1	RDPSink.monitor	module-rdp-sink.c	s16le 2ch 44100Hz	SUSPENDED
+2	RDPSource	module-rdp-source.c	s16le 1ch 44100Hz	SUSPENDED
+```
 
-| 方式 | 场景 | 命令 |
+实测能录到连续音频并识别出中文内容，所以 `--source pulse` 是这台机器上最接近「开麦」的用法。
+
+> 这台机器没装 `pulseaudio-utils`（要 root），所以我在 `~/.local/opt/pulse/` 放了一份免 root 的
+> `parec` / `pactl`，并已把 `~/.local/opt/pulse/bin` 加进 `~/.bashrc` 的 PATH。
+> 想要系统级安装就 `sudo apt install pulseaudio-utils`。
+
+### 想真正用上麦克风，三条路
+
+| 方案 | 做法 | 代价 |
 |---|---|---|
-| `--source file` | 听写已有音频 | `python3 dictation.py --file a.wav` |
-| `--source stdin` | 接任意采集程序 | `arecord -t raw -f S16_LE -r 16000 -c 1 \| python3 dictation.py --source stdin` |
-| `--source tcp` | 麦克风在别的机器上 | 服务端 `python3 dictation.py --source tcp --port 8765`，客户端 `python3 scripts/send_mic.py --host <IP> --port 8765` |
+| A. Windows 推流到 WSL2 | WSL2 起 `--source tcp`，Windows 跑 `scripts/send_mic.py` | Windows 装 `sounddevice` |
+| B. Windows 端原生跑 | 把这个仓库 clone 到 Windows，`pip install -r requirements.txt`，用 `sounddevice` 后端开麦 | 模型要再下一份到 Windows |
+| C. USB 麦克风透传 | Windows 装 `usbipd-win`，把 USB 麦克风透传进 WSL2 | 要装驱动、改 `.wslconfig` |
 
-把这套程序搬到有声卡的机器上，`python3 dictation.py` 直接就是麦克风听写。
+A 最省事：模型和算力都在这台机器上，Windows 只当「麦克风」。
+
+### 音频来源一览
+
+| `--source` | 说明 |
+|---|---|
+| `mic` | 本机麦克风。Linux 有 ALSA 采集设备时走 ALSA，否则自动回退到 `sounddevice` 后端（Windows/macOS 用这个） |
+| `file` | 听写音频文件，`--realtime` 可按 1 倍速喂 |
+| `stdin` | 从标准输入读 16 kHz / 单声道 / s16le PCM |
+| `pulse` | 抓 PulseAudio 采集源，`--device` 指定源名（`default` / `RDPSource`） |
+| `tcp` | 监听 TCP，收别的机器推来的 PCM |
 
 ---
 
@@ -109,8 +147,9 @@ pip install --user -r requirements.txt
 bash scripts/download_models.sh
 
 # 3. 开听
-python3 dictation.py                                   # 麦克风
+python3 dictation.py                                   # 麦克风（无采集设备时会说明原因）
 python3 dictation.py --file samples/1.wav               # 文件（仓库自带两段测试音频）
+python3 dictation.py --source pulse --device RDPSource  # 抓 PulseAudio 采集源
 python3 dictation.py --source tcp --port 8765          # 收别的机器推来的音频
 ```
 
@@ -120,14 +159,14 @@ python3 dictation.py --source tcp --port 8765          # 收别的机器推来�
 |---|---|
 | `--model` | 流式模型名或模型目录（`small-bilingual` / `bilingual` / `zh-14m` / `ctc-zh` / `paraformer-zh`） |
 | `--refine-model` | 整句重识别用的非流式模型，空串关闭 |
-| `--source` | `mic` / `file` / `stdin` / `tcp` |
+| `--source` | `mic` / `file` / `stdin` / `pulse` / `tcp` |
 | `--file` `--realtime` | 听写文件；`--realtime` 按 1 倍速喂，用来验证实时链路 |
-| `--device` | ALSA 设备名，默认 `default`；多麦机器用 `plughw:1,0` |
+| `--device` | `mic` 用 ALSA 设备名（`default`，多麦机器用 `plughw:1,0`）；`pulse` 用 PulseAudio 源名（`default` / `RDPSource`） |
 | `--out-dir` `--formats` | 输出目录与格式（`txt,md,srt,json`） |
 | `--no-punct` / `--no-vad` | 关标点 / 关 VAD（改用识别器端点检测切句） |
 | `--hotwords` | 热词文件，每行一个词或短语，提升专有名词准确率 |
 | `--threads` | 推理线程数，默认 2 |
-| `--list-devices` / `--list-models` | 列录音设备 / 列已下载模型 |
+| `--list-devices` / `--list-models` | 列采集设备（ALSA / Pulse / sounddevice）/ 列已下载模型 |
 
 终端上正在说的半句是灰色原地刷新，说完的句子带时间戳定格：
 
@@ -187,6 +226,14 @@ voice-dictation/
   看着像报错，其实不是。
 - **GitHub release 下载会被限速**：458 MB 的双语小模型在这台机器上跑了 25 分钟
   （约 130 KB/s），中途 TLS 还会断；脚本里带 `--retry` 和断点续传。
+- **免 root 装 pulseaudio-utils**：`apt-get download` 下 deb 再 `dpkg-deb -x` 解到
+  `~/.local/opt/pulse/`，但 `pactl`/`parec` 会依次缺 `libpulsecommon` / `libsndfile` /
+  `libFLAC` / `libX11-xcb`…，得把依赖一次性下齐（`apt-cache depends --recurse` 列全）。
+  解出来的 `parec`/`pactl` 要自己包一层 `LD_LIBRARY_PATH` 和 `PULSE_SERVER`。
+- **`is_speech_detected` 是方法不是属性**：sherpa-onnx 的 Python 绑定里
+  `vad.is_speech_detected` 少了括号会拿到 bound method，`if` 恒为真，行为会很怪。
+- **`RDPSource` 录到的是 Windows 会话的音频**：是不是包含麦克风取决于 Windows 那边的
+  录音重定向设置，WSL2 侧看不出来。
 
 ## 八、许可与来源
 

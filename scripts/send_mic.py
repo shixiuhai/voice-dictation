@@ -61,6 +61,15 @@ def wav_chunks(path: str, duration_ms: int, realtime: bool):
         yield block
 
 
+def stdin_chunks():
+    """把标准输入的 16k s16le PCM 原样转发出去。"""
+    while True:
+        data = sys.stdin.buffer.read(3200)
+        if not data:
+            break
+        yield np.frombuffer(data, dtype=np.int16)
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="把麦克风音频推到听写服务器")
     p.add_argument("--host", default="127.0.0.1", help="听写服务器地址")
@@ -68,9 +77,16 @@ def main() -> int:
     p.add_argument("--file", default="", help="改推 wav 文件而不是麦克风")
     p.add_argument("--realtime", action="store_true", help="推文件时按 1 倍速")
     p.add_argument("--chunk-ms", type=int, default=100, help="每次发送的长度")
+    p.add_argument(
+        "--stdin",
+        action="store_true",
+        help="从标准输入转发 16k s16le PCM（配合 ffmpeg 等采集程序）",
+    )
     args = p.parse_args()
 
-    if args.file:
+    if args.stdin:
+        chunks = stdin_chunks()
+    elif args.file:
         chunks = wav_chunks(args.file, args.chunk_ms, args.realtime)
     else:
         chunks = mic_chunks(args.chunk_ms)

@@ -29,10 +29,14 @@ from vd.asr import OfflineASR, StreamingASR
 from vd.audio import (
     SAMPLE_RATE,
     AlsaMic,
+    PulseSource,
     RawStdin,
+    SoundDeviceMic,
     TcpServer,
     WavFile,
     list_capture_devices,
+    list_pulse_sources,
+    list_sounddevice_inputs,
 )
 from vd.punct import Punctuator
 from vd.session import Terminal, TranscriptWriter
@@ -58,12 +62,16 @@ def parse_args(argv=None):
     )
     p.add_argument(
         "--source",
-        choices=["mic", "file", "stdin", "tcp"],
+        choices=["mic", "file", "stdin", "tcp", "pulse"],
         default="mic",
-        help="音频来源",
+        help="音频来源：mic 麦克风 / file 文件 / stdin 标准输入 / tcp 网络推流 / pulse PulseAudio 采集源",
     )
     p.add_argument("--file", default="", help="--source file 时的音频文件")
-    p.add_argument("--device", default="default", help="ALSA 录音设备名")
+    p.add_argument(
+        "--device",
+        default="",
+        help="录音设备名：mic 用 ALSA 设备名（default），pulse 用 PulseAudio 采集源名（default / RDPSource）",
+    )
     p.add_argument("--host", default="0.0.0.0", help="--source tcp 时的监听地址")
     p.add_argument("--port", type=int, default=8765, help="--source tcp 时的监听端口")
     p.add_argument("--realtime", action="store_true", help="读文件时按 1 倍速喂数据")
@@ -87,8 +95,8 @@ def parse_args(argv=None):
 
 
 def list_devices(term: Terminal) -> None:
-    """列出系统里的录音设备。"""
-    term.info("== 录音设备（ALSA）==")
+    """列出系统里能用的采集设备。"""
+    term.info("== ALSA 录音设备 ==")
     devices = list_capture_devices()
     if devices:
         for line in devices:
@@ -98,10 +106,30 @@ def list_devices(term: Terminal) -> None:
     else:
         term.info("  /proc/asound/pcm 不存在：内核里没有 ALSA 音频驱动")
         term.info("  常见于 WSL2 / 容器 / 云主机，这种环境拿不到本机麦克风")
+
+    term.info("")
+    term.info("== PulseAudio 采集源 ==")
+    pulse = list_pulse_sources()
+    if pulse:
+        for line in pulse:
+            term.info("  " + line)
+    else:
+        term.info("  没有可用的 PulseAudio 源（pactl 不可用或没有 Pulse 服务）")
+
+    term.info("")
+    term.info("== sounddevice 输入设备 ==")
+    sd = list_sounddevice_inputs()
+    if sd:
+        for line in sd:
+            term.info("  " + line)
+    else:
+        term.info("  没有（pip install sounddevice 可启用跨平台麦克风后端）")
+
     term.info("")
     term.info("== 改用其它音频来源 ==")
     term.info("  --source file  <wav>   听写一个音频文件")
     term.info("  --source stdin          从标准输入读 16k s16le PCM")
+    term.info("  --source pulse          抓 PulseAudio 采集源（WSLg 上可用 RDPSource 抓 Windows 会话音频）")
     term.info("  --source tcp            监听 TCP，让另一台机器把麦克风推过来")
 
 
@@ -118,16 +146,21 @@ def list_models(term: Terminal) -> None:
 
 def build_source(args):
     if args.source == "mic":
-        devices = list_capture_devices()
-        if not devices:
+        if list_capture_devices():
+            return AlsaMic(args.device or "default")
+        # 没有 ALSA 采集设备：退回跨平台后端（Windows / macOS / 无 ALSA 的 Linux）
+        try:
+            return SoundDeviceMic(args.device)
+        except ImportError:
             raise NoCaptureDevice()
-        return AlsaMic(args.device)
     if args.source == "file":
         if not args.file:
             raise SystemExit("--source file 需要同时给 --file")
         return WavFile(args.file, realtime=args.realtime)
     if args.source == "stdin":
         return RawStdin()
+    if args.source == "pulse":
+        return PulseSource(args.device or "default")
     return TcpServer(args.host, args.port)
 
 

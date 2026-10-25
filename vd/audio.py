@@ -49,7 +49,7 @@ def list_capture_devices() -> list[str]:
     """列出 ALSA 录音设备（来自 /proc/asound/pcm）。
 
     没有这个内核接口就返回空列表——WSL2、容器、云主机上通常就是这样，
-    这时候程序没法直接用本机麦克风，得改走 file / stdin / tcp。
+    这时候程序没法直接用本机麦克风，得改走 file / stdin / tcp / pulse。
     """
     pcm = Path("/proc/asound/pcm")
     if not pcm.is_file():
@@ -59,6 +59,47 @@ def list_capture_devices() -> list[str]:
         if "capture" in line:
             devices.append(line.strip())
     return devices
+
+
+def list_pulse_sources() -> list[str]:
+    """列出 PulseAudio 的采集源（需要 pactl，pulseaudio-utils 自带）。"""
+    import shutil
+    import subprocess
+
+    if shutil.which("pactl") is None:
+        return []
+    try:
+        out = subprocess.run(
+            ["pactl", "list", "short", "sources"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout
+    except Exception:
+        return []
+    sources = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[1] != "module-null-sink":
+            sources.append(f"{parts[1]}（{parts[0]}）{parts[2] if len(parts) > 2 else ''}")
+    return sources
+
+
+def list_sounddevice_inputs() -> list[str]:
+    """列出 sounddevice 看到的输入设备（跨平台）。"""
+    try:
+        import sounddevice as sd
+    except ImportError:
+        return []
+    try:
+        devices = sd.query_devices()
+    except Exception:
+        return []
+    return [
+        f"{i}: {d['name']}（{d.get('max_input_channels', 0)} 通道）"
+        for i, d in enumerate(devices)
+        if d.get("max_input_channels", 0) > 0
+    ]
 
 
 
@@ -87,6 +128,115 @@ class AlsaMic(AudioSource):
 
     def describe(self) -> str:
         return f"ALSA 设备 {self._device_name} @ {self.sample_rate} Hz"
+
+
+class SoundDeviceMic(AudioSource):
+    """用 sounddevice(PortAudio) 录音。
+
+    这是跨平台的后端：Windows / macOS / 没有 ALSA 的 Linux 都能用。
+    依赖 ``pip install sounddevice``（Windows/macOS 的轮子自带 portaudio）。
+    """
+
+    def __init__(self, device: str | int = "", sample_rate: int = SAMPLE_RATE):
+        import sounddevice as sd
+
+        self._sd = sd
+        if device == "":
+            index = None
+        elif isinstance(device, int) or str(device).isdigit():
+            index = int(device)
+        else:
+            index = self._find_by_name(device)
+        self._index = index
+        self.sample_rate = sample_rate
+        self._stream = sd.InputStream(
+            samplerate=sample_rate, channels=1, dtype="int16", device=index
+        )
+        self._stream.start()
+
+    def _find_by_name(self, name: str) -> int:
+        for i, dev in enumerate(self._sd.query_devices()):
+            if name.lower() in dev["name"].lower():
+                return i
+        raise ValueError(f"找不到音频输入设备: {name}")
+
+    def chunks(self, chunk_ms: int = 100) -> Iterator[np.ndarray]:
+        n = max(1, int(self.sample_rate * chunk_ms / 1000))
+        while True:
+            data, _ = self._stream.read(n)
+            yield np.asarray(data, dtype=np.float32).reshape(-1) / 32768.0
+
+    def close(self) -> None:
+        try:
+            self._stream.stop()
+            self._stream.close()
+        except Exception:
+            pass
+
+    def describe(self) -> str:
+        name = "默认设备"
+        if self._index is not None:
+            try:
+                name = self._sd.query_devices(self._index)["name"]
+            except Exception:
+                pass
+        return f"声卡输入 {name} @ {self.sample_rate} Hz（sounddevice）"
+
+
+class PulseSource(AudioSource):
+    """从 PulseAudio / PipeWire 的采集源录音。
+
+    靠 ``parec``（pulseaudio-utils 自带）取流，输出直接就是 16 kHz 单声道 s16le，
+    不需要额外的 Python 库。在 WSLg 上 ``RDPSource`` 能抓到 Windows 会话的音频，
+    是没有本机麦克风时最省事的取流方式。
+    """
+
+    def __init__(self, device: str = "default", sample_rate: int = SAMPLE_RATE):
+        self._cmd = [
+            "parec",
+            f"--device={device}",
+            "--format=s16le",
+            f"--rate={sample_rate}",
+            "--channels=1",
+        ]
+        self._device = device
+        self.sample_rate = sample_rate
+        self._proc = None
+        self._name = device
+
+    def chunks(self, chunk_ms: int = 100) -> Iterator[np.ndarray]:
+        import shutil
+        import subprocess
+
+        if shutil.which("parec") is None:
+            raise RuntimeError(
+                "找不到 parec。装一下：sudo apt install pulseaudio-utils"
+                "（Windows/macOS 用 --source mic 即可）"
+            )
+        self._proc = subprocess.Popen(
+            self._cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+        n = max(1, int(self.sample_rate * chunk_ms / 1000))
+        try:
+            while True:
+                block = self._proc.stdout.read(n * 2)
+                if not block or len(block) < n * 2:
+                    break
+                yield np.frombuffer(block, dtype=np.int16).astype(np.float32) / 32768.0
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        if self._proc is not None and self._proc.poll() is None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=2)
+            except Exception:
+                self._proc.kill()
+        self._proc = None
+
+    def describe(self) -> str:
+        return f"PulseAudio 源 {self._device} @ {self.sample_rate} Hz"
 
 
 class WavFile(AudioSource):
