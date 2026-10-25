@@ -23,9 +23,23 @@ python3 dictation.py --source ws --port 8765
 （浏览器采麦克风 → WebSocket 推回这台机器 → 实时出字 → 落盘）。
 详见 [`docs/windows-mic-wsl2.md`](docs/windows-mic-wsl2.md)。
 
+> **必须用 `localhost` 或 `127.0.0.1`**，不能用 WSL2 的 IP（`172.24.x.x`）。
+> 浏览器的 `getUserMedia` 只在「安全上下文」下可用，IP 地址不是安全上下文，
+> 页面能打开但**麦克风开不起来**。页面上有「麦克风可用 / 不可用」标签会提前告诉你，
+> 点「开始说话」后状态条也会直接写明卡在哪一步，不会「点了没反应」。
+
+页面本身就是个控制台，不用碰命令行：
+
+- **实时文字**：识别结果直接在页面上出（灰的是正在说的半句，定稿后带时间戳）
+- **改文件名 / 接着写**：改名即时生效，磁盘上的文件跟着改；能挑历史记录续写
+- **选麦克风、调输入增益**
+- **深色 / 浅色主题**：右上角一键切换，选择记在浏览器里；没手动选过时跟随系统
+- **下载**：`.md` / `.txt` / `.srt` / `.json` 一键存到 Windows
+
 > 文件是**边说边写**的：每识别出一句就重写一遍 `.md` / `.srt` / `.json`，
 > 进程被 kill 也不丢内容。`Ctrl+C` 只是收尾并补上最后一句。
 > 浏览器断开后服务端会继续等（再打开页面可接着说）；想「断开即退出」加 `--once`。
+> **页面不用等模型加载完**：端口一绑上就能打开（实测 2 毫秒），页面上自己轮询模型状态。
 
 其它几种玩法：
 
@@ -229,10 +243,13 @@ python3 dictation.py --append 会议纪要-20261025-142211 # 接着写这一份
 ```markdown
 # 语音听写记录
 
+- 名称：听写
 - 开始时间：2026-10-25 14:02:33
+- 结束时间：2026-10-25 14:05:12
 - 句数：14
 - 语音时长：142.6 s
 - 模型：small-bilingual
+- 整句重识别：paraformer-zh
 - 来源：浏览器麦克风（http://127.0.0.1:8765/）
 
 ---
@@ -246,6 +263,30 @@ python3 dictation.py --append 会议纪要-20261025-142211 # 接着写这一份
 第一句是个什么时态加了es是一般现代时，对，然后把它试测一下商品。
 ```
 
+### 下载
+
+浏览器页面「记录」区有四个下载按钮，存到 Windows 的下载目录；
+命令行也可以直接拉：
+
+```sh
+curl -O http://127.0.0.1:8765/download/听写-20261025-142211.md
+```
+
+服务端只允许下载记录目录下的 `.md` / `.txt` / `.srt` / `.json`，
+路径穿越（`../`）会被挡掉。
+
+### 不开浏览器怎么测
+
+`scripts/ws_probe.py` 模拟浏览器（手搓 WebSocket 帧，不依赖第三方库），
+可以拿来验证服务端链路，也可以在没麦克风的机器上出字：
+
+```sh
+python3 dictation.py --source ws --port 8765          # 另一个终端
+python3 scripts/ws_probe.py --file samples/1.wav --realtime
+```
+
+它会打印服务端推回来的每一句（`[segment]`）和半句（`[partial]`）。
+
 ## 六、程序结构
 
 ```
@@ -253,8 +294,8 @@ voice-dictation/
 ├── dictation.py            CLI 主程序：参数、主循环、实时显示
 ├── vd/
 │   ├── audio.py            音频源：浏览器 WS / ALSA / sounddevice / WAV / stdin / Pulse / TCP
-│   ├── wsserver.py         最小 WebSocket 服务端（浏览器麦克风用，无第三方依赖）
-│   ├── mic_client.html     浏览器采集页面（getUserMedia → 16k s16le）
+│   ├── wsserver.py         最小 WebSocket + HTTP 服务端（浏览器麦克风用，无第三方依赖）
+│   ├── mic_client.html     浏览器控制台（getUserMedia → 16k s16le + 实时文字 + 配置）
 │   ├── vad.py              Silero VAD 封装，切句
 │   ├── asr.py              流式 + 非流式识别封装
 │   ├── punct.py            标点恢复（CT-Transformer）
@@ -263,6 +304,7 @@ voice-dictation/
 ├── scripts/
 │   ├── download_models.sh  模型下载
 │   ├── send_mic.py         另一台机器把麦克风推过来（Python）
+│   ├── ws_probe.py         模拟浏览器的 ws 客户端（联调/自测用）
 │   ├── windows_mic_push.ps1  Windows 侧推流（只要 ffmpeg，不要 Python）
 │   └── bench.py            实测各模型 RTF
 ├── docs/
@@ -278,6 +320,22 @@ voice-dictation/
 
 音频源统一输出 16 kHz / 单声道 / float32，切句交给 VAD，
 最终文本 = 流式结果 →（可选）非流式重识别 →（可选）标点。
+
+### ws 源的服务端结构
+
+`vd/wsserver.py` 一个端口同时提供两样东西，**各跑各的线程，互不阻塞**：
+
+| 路径 | 作用 |
+|---|---|
+| `GET /` | 控制台页面 |
+| `GET /api/status` | 状态：模型就绪没、当前记录、句数、已识别内容 |
+| `GET /api/sessions` | 历史记录清单 |
+| `GET /download/<文件>` | 下载 `.md` / `.txt` / `.srt` / `.json` |
+| `GET /ws` | WebSocket：浏览器推 16 kHz s16le PCM，接收控制指令和识别结果 |
+
+页面在**模型加载完之前**就能打开（HTTP 线程在构造时就起来了），模型就绪后
+WebSocket 才开始接受握手（没就绪时返回 503，页面自己等）。
+这样「端口先绑定、模型后加载」就不会让浏览器干等。
 
 ## 七、坑
 
@@ -304,9 +362,18 @@ voice-dictation/
   录音重定向设置，WSL2 侧看不出来。
 - **浏览器端要接一个 gain=0 的节点再连 destination**：`ScriptProcessorNode` 不接到
   destination 不会被调度；直接接会把自己的麦克风声音放出来。
+- **浏览器的安全上下文**：`getUserMedia` 只在 `https` 或 `localhost`/`127.0.0.1` 下可用。
+  用 WSL2 的 IP（`http://172.24.x.x:8765/`）打开页面能看能点，但麦克风**开不起来**
+  ——这是浏览器的规则，不是本程序的限制。
 - **手写的 WebSocket 服务端**（`vd/wsserver.py`）只实现了最小子集：
   HTTP/1.1 升级握手 + 客户端带掩码的二进制帧。别指望它支持分片扩展、压缩、ping/pong 之外的
   控制帧。
+- **WS 源里 HTTP 和 WS 必须分线程**：早期版本把两者放在同一个 accept 循环里，
+  一个 WS 连接占着循环时，第二个标签页连页面都打不开（HTTP 请求排在 accept 队列里没人应答）。
+  现在 HTTP 每个连接一个线程，WS 也一个，多标签页互不阻塞。
+- **麦克风不抢**：先连上的那个客户端占着麦克风，后来的只收到提示，不会两个页面互相抢音频。
+- **`_reply` 的 body 必须是 bytes**：曾经把 str 传进去，异常被连接处理器吞掉，
+  表现是下载接口直接断连接（curl 看到 000 而不是 400）。
 
 ## 八、许可与来源
 

@@ -207,6 +207,20 @@ class DictationEngine:
         self._seg_start = 0.0  # 不用 VAD 时，这句的开始时间
         self._chunk_ms = chunk_ms
         self._offset = 0.0  # 追加到旧记录时，时间轴要往后平移这么多
+        self._last_partial = ""  # 上次推给前端的半句，避免重复刷
+
+    def _push(self, payload: dict) -> None:
+        """把一条事件推给前端（没有前端时是空操作）。"""
+        try:
+            self.source.push_event(payload)
+        except Exception:
+            pass
+
+    def _push_partial(self, text: str) -> None:
+        if text == self._last_partial:
+            return
+        self._last_partial = text
+        self._push({"cmd": "partial", "text": text})
 
     def _emit(self, start: float, end: float, samples, text: str) -> None:
         refined = False
@@ -219,9 +233,21 @@ class DictationEngine:
             text = self.punct.add(text)
         text = text.strip()
         if not text:
+            self._push_partial("")
             return
         self.writer.add(start, end, text, refined=refined)
         self.term.segment(start, end, text, refined=refined)
+        self._last_partial = ""
+        self._push(
+            {
+                "cmd": "segment",
+                "start": start,
+                "end": end,
+                "text": text,
+                "refined": refined,
+                "count": len(self.writer.segments),
+            }
+        )
 
     def handle_control(self, text: str) -> str:
         """处理浏览器发来的控制指令，返回要回给浏览器的字符串（没有就返回空）。
@@ -272,18 +298,6 @@ class DictationEngine:
             )
         return ""
 
-    def sessions_payload(self) -> str:
-        """浏览器连上时先推一份历史记录清单过去。"""
-        import json
-
-        return json.dumps(
-            {
-                "cmd": "sessions",
-                "items": list_sessions(self.writer.out_dir, exclude=self.writer.stem),
-            },
-            ensure_ascii=False,
-        )
-
     def run(self) -> None:
         for chunk in self.source.chunks(chunk_ms=self._chunk_ms):
             self._total += len(chunk)
@@ -299,6 +313,7 @@ class DictationEngine:
         text = self.asr.decode(self._stream)
         if text:
             self.term.partial(text)
+            self._push_partial(text)
         if self.asr.is_endpoint(self._stream):
             text = self.asr.finish(self._stream, self.sample_rate)
             self._emit(self._seg_start + self._offset,
@@ -325,6 +340,7 @@ class DictationEngine:
         text = self.asr.decode(self._stream)
         if text:
             self.term.partial(text)
+            self._push_partial(text)
 
     def _close_segments(self, fallback=None) -> None:
         """把说完的段收尾：出文本、落盘、换新流。
@@ -501,8 +517,29 @@ def main(argv=None) -> int:
     engine._offset = offset
     if hasattr(source, "on_text"):
         source.on_text = engine.handle_control
-    if hasattr(source, "on_connect"):
-        source.on_connect = engine.sessions_payload
+
+    # 浏览器页面要显示这些，所以注册成一个「随时可取」的状态提供器。
+    # 闭包读的是 writer 的当前值，改名 / 追加之后状态也跟着变。
+    def status_provider() -> dict:
+        return {
+            "model": spec.name,
+            "refine_model": refine_spec.name if refine_spec else "",
+            "source": source.describe(),
+            "stem": writer.stem,
+            "name": writer.name,
+            "out_dir": str(writer.out_dir),
+            "count": len(writer.segments),
+            "duration": round(max((s.end for s in writer.segments), default=0.0), 1),
+            "transcript": [
+                {"start": s.start, "end": s.end, "text": s.text, "refined": s.refined}
+                for s in writer.segments
+            ],
+        }
+
+    source.set_status_provider(status_provider)
+    source.set_sessions_provider(lambda: list_sessions(writer.out_dir, exclude=writer.stem))
+    source.set_ready(True)
+
     try:
         engine.run()
     except KeyboardInterrupt:

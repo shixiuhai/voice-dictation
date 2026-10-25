@@ -44,6 +44,18 @@ class AudioSource:
     def describe(self) -> str:
         return type(self).__name__
 
+    def push_event(self, payload: dict) -> None:
+        """把一条事件推给前端（只有 ws 源有前端，其余源忽略）。"""
+
+    def set_ready(self, ready: bool = True) -> None:
+        """音频源是否已就绪（ws 源用它表示模型加载完了没）。"""
+
+    def set_status_provider(self, fn) -> None:
+        """注册一个返回状态字典的函数，给前端的 /api/status 用。"""
+
+    def set_sessions_provider(self, fn) -> None:
+        """注册一个返回历史记录清单的函数。"""
+
 
 def list_capture_devices() -> list[str]:
     """列出 ALSA 录音设备（来自 /proc/asound/pcm）。
@@ -189,6 +201,9 @@ class WebSocketMic(AudioSource):
     这台 WSL2 没有声卡，Windows 上又常常没装 Python / ffmpeg，
     而 Edge / Chrome 是现成的——所以给了一条零安装的路径：
     浏览器打开服务端给的页面，点一下就能说话。
+
+    同一个端口上还兼着 HTTP 服务（页面 / 状态 / 下载），HTTP 线程在构造时
+    就起来了，所以端口一绑上页面就能打开，不用等模型加载完。
     """
 
     def __init__(
@@ -216,22 +231,27 @@ class WebSocketMic(AudioSource):
         self._server.on_text = fn
 
     @property
-    def on_connect(self):
-        """浏览器连上时先推一条消息（比如历史记录清单）时的回调。"""
-        return self._server.on_connect
-
-    @on_connect.setter
-    def on_connect(self, fn):
-        self._server.on_connect = fn
-
-    @property
     def address(self) -> tuple[str, int]:
         return self._server.address
 
     def chunks(self, chunk_ms: int = 100) -> Iterator[np.ndarray]:
         yield from self._server.chunks(chunk_ms=chunk_ms)
+
     def close(self) -> None:
         self._server.close()
+
+    def push_event(self, payload: dict) -> None:
+        """把识别结果（半句 / 定稿句）推给浏览器。"""
+        self._server.broadcast(payload)
+
+    def set_ready(self, ready: bool = True) -> None:
+        self._server.set_ready(ready)
+
+    def set_status_provider(self, fn) -> None:
+        self._server.set_status_provider(fn)
+
+    def set_sessions_provider(self, fn) -> None:
+        self._server.set_sessions_provider(fn)
 
     def describe(self) -> str:
         host, port = self.address

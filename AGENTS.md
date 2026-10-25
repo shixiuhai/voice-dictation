@@ -31,6 +31,11 @@ WSL2 不透传宿主机声卡。`--source mic` 在这台机器上必然失败，
 | Windows 会话音频 | `python3 dictation.py --source pulse --device RDPSource`（WSLg 的 RDP 采集源） |
 | 文件 | `python3 dictation.py --file samples/1.wav` |
 
+> **WSL2 的 IP 只能看页面，不能录音**：`getUserMedia` 只在安全上下文
+> （`https` 或 `localhost`/`127.0.0.1`）下可用。`http://172.24.x.x:8765/`
+> 能打开页面但麦克风开不起来——这是浏览器规则，不是本程序限制。
+> 录音必须走 `localhost` / `127.0.0.1`。
+
 ## 3. 网络
 
 - **Windows → WSL2**：`127.0.0.1:<端口>`（localhost 转发默认开）。不通就换 WSL2 IP：`hostname -I` 取第一个（这台是 `172.24.246.226`）。
@@ -82,12 +87,41 @@ WSL2 不透传宿主机声卡。`--source mic` 在这台机器上必然失败，
   浏览器关掉再打开能接着说，同一个记录文件。
 - **端口先绑定、模型后加载**：`main()` 里先 `build_source()`（`ws`/`tcp` 在这里 bind），
   再加载模型。否则浏览器打开得太早会连不上。现在页面还会自己重试，两边都兜住。
-- **`--source ws` 用的 WebSocket 服务端是自己手写的最小实现**（`vd/wsserver.py`）：
-  HTTP/1.1 升级握手 + 客户端带掩码的二进制帧，没有第三方依赖。
+- **ws 源的 HTTP 与 WS 是分开的线程**（`vd/wsserver.py`）：
+  HTTP 线程在 `MicWebServer.__init__` 就起来了，所以**页面秒开**（实测 2 ms，
+  不用等 13~16 秒的模型加载），页面自己轮询 `/api/status` 看模型就绪没；
+  就绪前 WS 握手返回 503。HTTP 和 WS 各占一个连接线程，多标签页互不阻塞。
   改协议时注意：客户端→服务端的帧是带掩码的；不支持分片扩展与压缩。
+- **WS 源上服务端也会往浏览器推消息**：半句 `{"cmd":"partial"}`、
+  定稿句 `{"cmd":"segment"}`、状态 `{"cmd":"status"}`、连上时的
+  `{"cmd":"hello"}`（带历史 transcript 和会话清单）。引擎侧由
+  `DictationEngine._push()` → `AudioSource.push_event()` 转发。
+- **麦克风不抢**：`wsserver._push_audio()` 里先到的客户端一直占着麦克风，
+  后来的只收到 `{"cmd":"superseded"}`，不会两个页面来回抢音频。
 - **浏览器端用 ScriptProcessorNode**（已废弃但 Chrome/Edge 仍支持），
   采样率不是 16 k 时在页面里做线性重采样；接了一个 gain=0 的节点再连 destination，
   否则 onaudioprocess 不会被调度，且会把麦克风声音放出来。
+- **页面的状态条是唯一的对外口径**（`vd/mic_client.html` 的 `updateStatus()`）：
+  所有提示都从这一个函数出去，临时提示走 `say()`（带过期时间，几秒后自动回落到
+  常态文案）。**「开始说话」按钮任何时候都可点**，不再 `disabled`——
+  点了必须要有回音（模型没就绪 / 正在连服务 / 正在等授权 / 地址不对 / 权限被拒），
+  「点了没反应」是这个页面最严重的回归。
+- **页面自己判断能不能用麦克风**：`window.isSecureContext` 为 false 时
+  `navigator.mediaDevices` 整个是 `undefined`，`getUserMedia` 会**同步抛异常**，
+  异常会逃出事件处理函数、被浏览器吞掉，表现为「点了没反应」。
+  所以 `startMic()` 里 `getUserMedia` 必须用 `try/catch` 包住，
+  并在页面上用「麦克风可用 / 不可用」标签提前提示（IP 地址访问就是这样）。
+- **AudioContext 可能是 suspended**：`ws.onopen` 回调不是用户手势，
+  在那里创建的 `AudioContext` 可能停在 `suspended`，那样会一直在采空气、
+  一句都不出。`setupAudio()` 里要显式 `ctx.resume()`。
+- **页面的主题是 CSS 变量**（`vd/mic_client.html`）：`:root` 是深色，
+  `[data-theme="light"]` 覆盖同一批变量（30 个，两边一一对应）。
+  规则里**不要再写死颜色**——加新颜色先加变量，两套主题都要给值。
+  `<head>` 里有段小脚本在渲染前把 `data-theme` 定下来（读 `localStorage`，
+  没有就跟随 `prefers-color-scheme`），所以刷新时不会闪一下白；
+  用户手动选过之后就跟系统无关了。
+- **`scripts/ws_probe.py`** 是不开浏览器时模拟浏览器的客户端（手搓 WS 帧），
+  用来验证服务端链路。推流末尾要补静音，否则 VAD 不切句、看不到定稿句。
 
 ## 6. 改代码前先知道的坑
 
@@ -99,6 +133,9 @@ WSL2 不透传宿主机声卡。`--source mic` 在这台机器上必然失败，
   必须在开设备之前先用 `/proc/asound/pcm` 探测有没有采集设备。
 - **带热词必须用 `modified_beam_search`**，sherpa-onnx 会直接抛错（程序里已自动切换）。
 - **8 kHz 音频**会在 stderr 打出 `Creating a resampler`，不是报错。
+- **ws 源的错误分支要小心**：`wsserver._reply()` 的 body 必须是 bytes。
+  传了 str 会抛 `TypeError`，而连接处理器会把异常吞掉——表现是下载接口直接断连接
+  （curl 看到 000 而不是 400），排查起来很绕。
 
 ## 7. 提交与推送
 
