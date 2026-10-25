@@ -23,6 +23,8 @@
   input[type=text] { font-size:14px; padding:9px 12px; border-radius:8px; width:260px;
                      border:1px solid #3c4043; background:#1f2227; color:#e8eaed; }
   input[type=text]:focus { outline:none; border-color:#8ab4f8; }
+  select { font-size:14px; padding:9px 12px; border-radius:8px; max-width:420px;
+           border:1px solid #3c4043; background:#1f2227; color:#e8eaed; }
   .box { margin-top:22px; padding:14px 16px; border-radius:8px; background:#1f2227;
          font-size:13px; line-height:1.7; color:#bdc1c6; }
   code { background:#2a2d33; padding:1px 6px; border-radius:4px; font-size:12px; }
@@ -41,6 +43,11 @@
 </div>
 
 <div class="row">
+  <label for="history">接着写</label>
+  <select id="history"><option value="">（新建记录）</option></select>
+</div>
+
+<div class="row">
   <button id="toggle">开始说话</button>
 </div>
 
@@ -49,7 +56,8 @@
   2. 正常说话，WSL2 终端里会实时出字<br>
   3. 说完点「停止」，听写记录已写入 WSL2 的 <code>transcripts/</code> 目录<br><br>
   文件名规则：<code>&lt;名字&gt;-&lt;开始时间&gt;</code>，例如 <code>会议纪要-20261025-142211.md</code>。
-  名字可以随时改，磁盘上的文件会跟着改名，不会覆盖旧记录。<br><br>
+  名字可以随时改，磁盘上的文件会跟着改名，不会覆盖旧记录。<br>
+  「接着写」可以挑一份历史记录继续说，新内容接在它后面，时间戳接着往下走。<br><br>
   注意：浏览器采到的是 <b>16 kHz 单声道</b> PCM；已关掉回声消除与降噪，
   需要关掉的话是浏览器/驱动层面的事，这里默认保留原始人声。
 </div>
@@ -63,6 +71,7 @@ const statusEl = document.getElementById('status');
 const btn = document.getElementById('toggle');
 const nameInput = document.getElementById('fname');
 const renameBtn = document.getElementById('rename');
+const historySel = document.getElementById('history');
 
 function status(text, cls) {
   statusEl.textContent = text;
@@ -77,10 +86,17 @@ function connect() {
   ws.onopen = () => { status('已连接，正在打开麦克风…'); startMic(); };
   ws.onmessage = ev => {
     if (typeof ev.data !== 'string') return;
-    try {
-      const m = JSON.parse(ev.data);
-      if (m.cmd === 'name_ok') status('记录文件：' + m.stem + '.md', 'on');
-    } catch (e) { /* 忽略非 JSON 消息 */ }
+    let m;
+    try { m = JSON.parse(ev.data); } catch (e) { return; }
+    if (m.cmd === 'name_ok') {
+      status('记录文件：' + m.stem + '.md', 'on');
+    } else if (m.cmd === 'append_ok') {
+      status('正在追加到：' + m.stem + '.md（时间轴从 ' + Number(m.offset).toFixed(1) + 's 接着走）', 'on');
+    } else if (m.cmd === 'sessions') {
+      fillHistory(m.items || []);
+    } else if (m.cmd === 'error') {
+      status('操作失败：' + (m.message || ''), 'err');
+    }
   };
   ws.onclose = () => {
     stopMic(false);
@@ -96,12 +112,33 @@ function connect() {
   ws.onerror = () => {};
 }
 
+function fillHistory(items) {
+  historySel.innerHTML = '<option value="">（新建记录）</option>';
+  items.forEach(it => {
+    const when = it.started ? it.started.replace('T', ' ').slice(5, 16) : '';
+    const opt = document.createElement('option');
+    opt.value = it.stem;
+    opt.textContent = `${it.name}  ·  ${when}  ·  ${it.count} 句`;
+    historySel.appendChild(opt);
+  });
+}
+
 function sendName() {
   if (!ws || ws.readyState !== 1) {
     status('还没连上听写服务，等两秒再试', 'err');
     return;
   }
   ws.send(JSON.stringify({ cmd: 'name', name: nameInput.value }));
+}
+
+function sendAppend() {
+  const stem = historySel.value;
+  if (!stem) return;                       // 回到「新建记录」就不用管
+  if (!ws || ws.readyState !== 1) {
+    status('还没连上听写服务，等两秒再试', 'err');
+    return;
+  }
+  ws.send(JSON.stringify({ cmd: 'append', stem: stem }));
 }
 
 function startMic() {
@@ -179,6 +216,7 @@ function toInt16(f32) {
 
 renameBtn.onclick = sendName;
 nameInput.addEventListener('keydown', e => { if (e.key === 'Enter') sendName(); });
+historySel.onchange = sendAppend;
 
 btn.onclick = () => {
   if (micOn) {

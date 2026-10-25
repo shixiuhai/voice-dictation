@@ -12,6 +12,9 @@ from pathlib import Path
 DEFAULT_NAME = "听写"
 _TIME_FORMAT = "%Y%m%d-%H%M%S"
 
+_TXT_SEG = re.compile(r"^\[(\d+:\d+:\d+\.\d+) --> (\d+:\d+:\d+\.\d+)\] (.*)$")
+_MD_SEG = re.compile(r"^##\s+(\d+:\d+:\d+)\s+→\s+(\d+:\d+:\d+)\s*$")
+
 
 def sanitize_name(name: str, fallback: str = DEFAULT_NAME) -> str:
     """把外部给的名字洗成安全的文件名片段。
@@ -30,12 +33,145 @@ def sanitize_name(name: str, fallback: str = DEFAULT_NAME) -> str:
     return name[:60]
 
 
+def sanitize_stem(stem: str) -> str:
+    """把外部给的文件名主干洗成安全的片段（同样防目录穿越）。"""
+    stem = (stem or "").strip()
+    stem = stem.replace("\\", "/").split("/")[-1]
+    stem = stem.replace("..", "")
+    stem = re.sub(r"[\x00-\x1f\x7f<>:\"\\|?*]", "_", stem)
+    return stem[:120]
+
+
+def _parse_hms(text: str) -> float:
+    """``01:02:03.456`` -> 3723.456"""
+    parts = text.strip().split(":")
+    if len(parts) != 3:
+        return 0.0
+    try:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    except ValueError:
+        return 0.0
+
+
 @dataclass
 class Segment:
     start: float
     end: float
     text: str
     refined: bool = False
+
+
+def load_session(out_dir: Path, stem: str) -> tuple[list[Segment], str, datetime | None]:
+    """读出一个已存在的会话（优先 json，其次 txt，再次 md）。
+
+    返回 (句子列表, 名称, 开始时间)。文件不存在时返回空。
+    """
+    out_dir = Path(out_dir)
+
+    path = out_dir / f"{stem}.json"
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            segs = [
+                Segment(
+                    start=float(s.get("start", 0.0)),
+                    end=float(s.get("end", 0.0)),
+                    text=s.get("text", ""),
+                    refined=bool(s.get("refined", False)),
+                )
+                for s in data.get("segments", [])
+            ]
+            sess = data.get("session", {})
+            name = str(sess.get("name", ""))
+            started = None
+            if sess.get("started_at"):
+                try:
+                    started = datetime.fromisoformat(str(sess["started_at"]))
+                except ValueError:
+                    started = None
+            return segs, name, started
+        except (OSError, ValueError, TypeError):
+            pass
+
+    path = out_dir / f"{stem}.txt"
+    if path.is_file():
+        segs: list[Segment] = []
+        name = ""
+        started = None
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                m = _TXT_SEG.match(line)
+                if m:
+                    segs.append(Segment(_parse_hms(m.group(1)), _parse_hms(m.group(2)), m.group(3)))
+                elif line.startswith("# 名称:"):
+                    name = line.split(":", 1)[1].strip()
+                elif line.startswith("# 语音听写记录"):
+                    ts = line.split("  ")[-1].strip()
+                    try:
+                        started = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+                    except ValueError:
+                        pass
+        except OSError:
+            pass
+        return segs, name, started
+
+    path = out_dir / f"{stem}.md"
+    if path.is_file():
+        segs = []
+        name = ""
+        started = None
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return segs, name, started
+        for i, line in enumerate(lines):
+            if line.startswith("- 名称："):
+                name = line.split("：", 1)[1].strip()
+            elif line.startswith("- 开始时间："):
+                try:
+                    started = datetime.strptime(line.split("：", 1)[1].strip(), "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    pass
+            m = _MD_SEG.match(line)
+            if m:
+                text_lines = []
+                j = i + 1
+                while j < len(lines) and lines[j].strip():
+                    text_lines.append(lines[j].strip())
+                    j += 1
+                segs.append(
+                    Segment(_parse_hms(m.group(1)), _parse_hms(m.group(2)), " ".join(text_lines))
+                )
+        return segs, name, started
+
+    return [], "", None
+
+
+def list_sessions(out_dir: Path, exclude: str = "") -> list[dict]:
+    """列出已有会话，按开始时间倒序（新的在前）。
+
+    ``exclude`` 用来排除当前正在写的那份（它是空的，出现在清单里只会让人困惑）。
+    """
+    out_dir = Path(out_dir)
+    items = []
+    for path in out_dir.glob("*.md"):
+        stem = path.stem
+        if exclude and stem == exclude:
+            continue
+        segs, name, started = load_session(out_dir, stem)
+        if not segs and not name:
+            continue
+        items.append(
+            {
+                "stem": stem,
+                "name": name or stem,
+                "started": started.isoformat(timespec="seconds") if started else "",
+                "count": len(segs),
+                "duration": round(max((s.end for s in segs), default=0.0), 1),
+            }
+        )
+    items.sort(key=lambda x: x["started"], reverse=True)
+    return items
 
 
 def _hms(seconds: float, comma: bool = False) -> str:
@@ -109,6 +245,55 @@ class TranscriptWriter:
                 old.replace(new)
         self._flush_all()
         return self.stem
+
+    def attach(self, stem: str) -> float:
+        """切到一份已有的记录继续写，返回时间偏移（秒）。
+
+        已有内容会被读回来（句子、名称、开始时间），新说的内容接在后面，
+        时间戳从原记录的最后一句之后接着走。返回的偏移量给上层用来平移时间轴。
+        """
+        stem = sanitize_stem(stem)
+        if not stem:
+            raise ValueError("记录文件名不能为空")
+        if not (self.out_dir / f"{stem}.md").is_file():
+            raise FileNotFoundError(f"没有这份记录: {stem}")
+
+        segs, name, started = load_session(self.out_dir, stem)
+        offset = max((s.end for s in segs), default=0.0)
+
+        # 刚建好就改投别的记录的话，别把空壳留在目录里
+        if not self.segments and self.stem != stem:
+            for ext in ("txt", "md", "srt", "json"):
+                stale = self.out_dir / f"{self.stem}.{ext}"
+                if stale.is_file():
+                    try:
+                        stale.unlink()
+                    except OSError:
+                        pass
+
+        if self._txt:
+            self._txt.close()
+            self._txt = None
+        self.stem = stem
+        if name:
+            self.name = name
+        if started:
+            self.started_at = started
+        self.segments = segs
+
+        if "txt" in self.formats:
+            path = self.out_dir / f"{stem}.txt"
+            existed = path.is_file()
+            self._txt = open(path, "a", encoding="utf-8")
+            if not existed:
+                self._txt.write(f"# 语音听写记录  {self.started_at:%Y-%m-%d %H:%M:%S}\n")
+                self._txt.write(f"# 名称: {self.name}\n")
+                for k, v in self.meta.items():
+                    self._txt.write(f"# {k}: {v}\n")
+                self._txt.write("\n")
+                self._txt.flush()
+        self._flush_all()
+        return offset
 
     def add(self, start: float, end: float, text: str, refined: bool = False) -> Segment:
         seg = Segment(start=start, end=end, text=text, refined=refined)

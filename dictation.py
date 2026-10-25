@@ -40,7 +40,7 @@ from vd.audio import (
     list_sounddevice_inputs,
 )
 from vd.punct import Punctuator
-from vd.session import Terminal, TranscriptWriter
+from vd.session import Terminal, TranscriptWriter, list_sessions
 from vd.vad import SpeechVAD
 
 DEFAULT_OUT_DIR = Path(__file__).resolve().parent / "transcripts"
@@ -81,6 +81,17 @@ def parse_args(argv=None):
         "--out-name",
         default="",
         help="记录文件名前缀，最终文件名是 <前缀>-<开始时间>.md（默认「听写」）",
+    )
+    p.add_argument(
+        "--append",
+        default="",
+        metavar="STEM",
+        help="追加到已有的记录（文件名主干，如 会议纪要-20261025-142211）",
+    )
+    p.add_argument(
+        "--list-sessions",
+        action="store_true",
+        help="列出输出目录里已有的记录后退出",
     )
     p.add_argument(
         "--formats",
@@ -195,6 +206,7 @@ class DictationEngine:
         self._cur_start = None  # 当前 VAD 段的起始采样偏移
         self._seg_start = 0.0  # 不用 VAD 时，这句的开始时间
         self._chunk_ms = chunk_ms
+        self._offset = 0.0  # 追加到旧记录时，时间轴要往后平移这么多
 
     def _emit(self, start: float, end: float, samples, text: str) -> None:
         refined = False
@@ -214,8 +226,12 @@ class DictationEngine:
     def handle_control(self, text: str) -> str:
         """处理浏览器发来的控制指令，返回要回给浏览器的字符串（没有就返回空）。
 
-        目前只有一条：``{"cmd": "name", "name": "会议"}`` —— 改记录文件名。
-        名字会被消毒（去路径、限长），所以外部推过来的东西不会写到任意路径。
+        - ``{"cmd": "name", "name": "会议"}`` —— 改记录文件名
+        - ``{"cmd": "append", "stem": "会议-20261025-142211"}`` —— 追加到已有记录
+        - ``{"cmd": "list"}`` —— 列已有记录
+
+        名字和文件名主干都来自浏览器，是外部输入：
+        ``sanitize_name`` / ``sanitize_stem`` 负责消毒，这里只做调度。
         """
         import json
 
@@ -225,12 +241,48 @@ class DictationEngine:
             return ""
         if not isinstance(msg, dict):
             return ""
-        if msg.get("cmd") != "name":
-            return ""
-        stem = self.writer.set_name(str(msg.get("name", ""))[:120])
-        path = self.writer.out_dir / (stem + ".md")
-        self.term.info(f"记录文件: {path}")
-        return json.dumps({"cmd": "name_ok", "stem": stem}, ensure_ascii=False)
+
+        cmd = msg.get("cmd")
+        if cmd == "name":
+            stem = self.writer.set_name(str(msg.get("name", ""))[:120])
+            path = self.writer.out_dir / (stem + ".md")
+            self.term.info(f"记录文件: {path}")
+            return json.dumps({"cmd": "name_ok", "stem": stem}, ensure_ascii=False)
+
+        if cmd == "append":
+            try:
+                offset = self.writer.attach(str(msg.get("stem", "")))
+            except (ValueError, FileNotFoundError) as e:
+                return json.dumps({"cmd": "error", "message": str(e)}, ensure_ascii=False)
+            self._offset = offset
+            path = self.writer.out_dir / (self.writer.stem + ".md")
+            self.term.info(f"追加到: {path}（时间轴从 {offset:.1f}s 接着走）")
+            return json.dumps(
+                {"cmd": "append_ok", "stem": self.writer.stem, "offset": offset},
+                ensure_ascii=False,
+            )
+
+        if cmd == "list":
+            return json.dumps(
+                {
+                    "cmd": "sessions",
+                    "items": list_sessions(self.writer.out_dir, exclude=self.writer.stem),
+                },
+                ensure_ascii=False,
+            )
+        return ""
+
+    def sessions_payload(self) -> str:
+        """浏览器连上时先推一份历史记录清单过去。"""
+        import json
+
+        return json.dumps(
+            {
+                "cmd": "sessions",
+                "items": list_sessions(self.writer.out_dir, exclude=self.writer.stem),
+            },
+            ensure_ascii=False,
+        )
 
     def run(self) -> None:
         for chunk in self.source.chunks(chunk_ms=self._chunk_ms):
@@ -249,7 +301,8 @@ class DictationEngine:
             self.term.partial(text)
         if self.asr.is_endpoint(self._stream):
             text = self.asr.finish(self._stream, self.sample_rate)
-            self._emit(self._seg_start, self._total / self.sample_rate, None, text)
+            self._emit(self._seg_start + self._offset,
+                      self._total / self.sample_rate + self._offset, None, text)
             self._stream = self.asr.new_stream()
             self._seg_start = self._total / self.sample_rate
 
@@ -288,8 +341,8 @@ class DictationEngine:
             text = self.asr.finish(self._stream, self.sample_rate)
             if seg is not None:
                 self._emit(
-                    seg.start / self.sample_rate,
-                    seg.end / self.sample_rate,
+                    seg.start / self.sample_rate + self._offset,
+                    seg.end / self.sample_rate + self._offset,
                     seg.samples,
                     text,
                 )
@@ -303,8 +356,8 @@ class DictationEngine:
             self.asr.feed(stream, seg.samples, self.sample_rate)
             text = self.asr.finish(stream, self.sample_rate)
             self._emit(
-                seg.start / self.sample_rate,
-                seg.end / self.sample_rate,
+                seg.start / self.sample_rate + self._offset,
+                seg.end / self.sample_rate + self._offset,
                 seg.samples,
                 text,
             )
@@ -317,7 +370,8 @@ class DictationEngine:
             self._close_segments(fallback=cur)
         else:
             text = self.asr.finish(self._stream, self.sample_rate)
-            self._emit(self._seg_start, self._total / self.sample_rate, None, text)
+            self._emit(self._seg_start + self._offset,
+                      self._total / self.sample_rate + self._offset, None, text)
 
 
 def main(argv=None) -> int:
@@ -333,6 +387,16 @@ def main(argv=None) -> int:
         return 0
     if args.list_models:
         list_models(term)
+        return 0
+    if args.list_sessions:
+        term.info(f"== 已有记录（{Path(args.out_dir).expanduser()}）==")
+        items = list_sessions(Path(args.out_dir).expanduser())
+        if not items:
+            term.info("  （空）")
+        for item in items:
+            term.info(
+                f"  {item['stem']}  {item['started']}  {item['count']} 句  {item['duration']}s"
+            )
         return 0
 
     try:
@@ -419,11 +483,26 @@ def main(argv=None) -> int:
     )
     term.info(f"记录文件: {writer.out_dir / (writer.stem + '.md')}")
 
+    offset = 0.0
+    if args.append:
+        try:
+            offset = writer.attach(args.append)
+        except (ValueError, FileNotFoundError) as e:
+            term.info(f"追加失败: {e}")
+            return 2
+        term.info(
+            f"已追加到: {writer.out_dir / (writer.stem + '.md')}"
+            f"（时间轴从 {offset:.1f}s 接着走）"
+        )
+
     engine = DictationEngine(
         source, asr, refine, vad, writer, term, punct, chunk_ms=args.chunk_ms
     )
+    engine._offset = offset
     if hasattr(source, "on_text"):
         source.on_text = engine.handle_control
+    if hasattr(source, "on_connect"):
+        source.on_connect = engine.sessions_payload
     try:
         engine.run()
     except KeyboardInterrupt:

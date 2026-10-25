@@ -216,6 +216,15 @@ class WebSocketMic(AudioSource):
         self._server.on_text = fn
 
     @property
+    def on_connect(self):
+        """浏览器连上时先推一条消息（比如历史记录清单）时的回调。"""
+        return self._server.on_connect
+
+    @on_connect.setter
+    def on_connect(self, fn):
+        self._server.on_connect = fn
+
+    @property
     def address(self) -> tuple[str, int]:
         return self._server.address
 

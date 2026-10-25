@@ -90,6 +90,8 @@ class MicWebServer:
         self._conn: socket.socket | None = None
         # 浏览器可以用文本帧下发控制指令（比如改记录文件名）
         self.on_text = None
+        # 浏览器连上时先推一条消息（比如历史记录清单）
+        self.on_connect = None
 
     @property
     def address(self) -> tuple[str, int]:
@@ -166,6 +168,13 @@ class MicWebServer:
                     continue
                 print(f"[WS] 浏览器已连接 {addr[0]}:{addr[1]}", flush=True)
                 self._conn = conn
+                if self.on_connect is not None:
+                    try:
+                        payload = self.on_connect()
+                        if payload:
+                            send_frame(conn, payload.encode("utf-8"), OPCODE_TEXT)
+                    except Exception as e:
+                        print(f"[WS] 推送初始消息失败: {e}", flush=True)
                 buf = bytearray()
                 while True:
                     opcode, payload = read_frame(conn)
