@@ -1,0 +1,8 @@
+# 运行时依赖
+#
+# 只装 sherpa-onnx 就够：它自带 onnxruntime，不需要 torch / transformers。
+# numpy 由 sherpa-onnx 依赖自动装上。
+sherpa-onnx>=2.0.0
+
+# 只有 scripts/send_mic.py（用本机麦克风推流）才需要：
+# sounddevice>=0.4

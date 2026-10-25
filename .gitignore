@@ -1,0 +1,10 @@
+# 模型与听写记录：运行时产物，脚本可重新下载/生成，不入库
+models/
+transcripts/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
