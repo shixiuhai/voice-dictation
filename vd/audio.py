@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import collections
 import socket
 import struct
 import sys
@@ -120,6 +121,96 @@ def list_sounddevice_inputs() -> list[str]:
         if d.get("max_input_channels", 0) > 0
     ]
 
+
+
+class LevelNormalizer:
+    """电平归一化：只在输入**整体偏轻**时往上补增益，语音本身逐采样不变。
+
+    为什么需要它：Silero VAD 的 ``threshold`` 判的是「语音概率」，但输入电平
+    太低时模型输出的概率整体偏低，阈值根本跨不过去——表现是**一句都不出**，
+    而不是出得不准。实测（``samples/1.wav`` 逐级衰减）：
+
+        衰减      电平        VAD=0.5
+        -24 dB   -48.9 dBFS   正常
+        -30 dB   -54.9 dBFS   开始漏字
+        -36 dB   -60.9 dBFS   0 句，完全没有输出
+
+    补上增益后一直到约 -79 dBFS 都能正常切句。
+
+    这里的判据是**「最近有没有够响的内容」**（``healthy_window`` 秒内的峰值），
+    而不是瞬时电平。这一点很关键：早先用「瞬时 RMS 对目标值归一化」，正常语音
+    句间的停顿也会被补上近 20 倍增益（停顿处 RMS 很低），把「today is 礼拜二」
+    识别成了「today is li 巴 a」。现在只要最近 5 秒内出现过 ≥0.1 的峰值，
+    增益就锁死在 1.0，语音一个采样都不动（实测 `samples/*.wav` 的语音帧
+    0 个被改动，被改的只有开头那 0.8 秒静音）。
+
+    另外两个刻意设计：
+
+    - **只补不削**，增益夹在 ``[1, max_gain]``，不会引入电平归一化的抽吸失真。
+    - **降增益立刻生效、升增益限速**（``max_rise``），既防削顶也防抽吸。
+
+    底噪会不会被放大成「假语音」？实测纯噪声在 -30 ~ -75 dBFS 各档放大后
+    仍然是 0 句。
+    """
+
+    def __init__(
+        self,
+        sample_rate: int = SAMPLE_RATE,
+        frame_ms: int = 100,
+        target_rms: float = 0.05,
+        max_gain: float = 20.0,
+        healthy_peak: float = 0.1,
+        healthy_window: float = 5.0,
+        release_tau: float = 0.5,
+        max_rise: float = 2.0,
+    ):
+        self.frame = max(1, int(sample_rate * frame_ms / 1000))
+        self.target_rms = target_rms
+        self.max_gain = max(1.0, float(max_gain))
+        # 最近 healthy_window 秒内出现过这么高的峰值，就认为电平健康，不再补增益
+        self.healthy_peak = healthy_peak
+        self._peaks = collections.deque(maxlen=max(1, int(healthy_window * 1000 / frame_ms)))
+        self.release = float(np.exp(-(frame_ms / 1000.0) / release_tau))
+        self.max_rise = max(1.0, float(max_rise))
+        self.gain = 1.0
+        self._follow = 0.0
+        self._buf = np.zeros(0, dtype=np.float32)
+
+    def process(self, samples: np.ndarray) -> np.ndarray:
+        """返回与输入**等长**的音频（时间轴不动，时间戳才不会漂）。"""
+        if samples.size == 0:
+            return samples
+        if self.max_gain <= 1.0:
+            return samples
+        self._buf = np.concatenate([self._buf, samples.astype(np.float32, copy=False)])
+        n_block = len(self._buf) // self.frame
+        processed = np.zeros(0, dtype=np.float32)
+        if n_block:
+            blocks = self._buf[: n_block * self.frame].reshape(n_block, self.frame)
+            self._buf = self._buf[n_block * self.frame :]
+            out = np.empty_like(blocks)
+            for i in range(n_block):
+                blk = blocks[i]
+                rms = float(np.sqrt(np.mean(blk.astype(np.float64) ** 2)))
+                # 「最近够不够响」看一段窗口内的最大峰值，而不是瞬时电平：
+                # 否则正常语音句间的停顿（瞬时电平很低）也会被补上大增益
+                self._peaks.append(float(np.max(np.abs(blk))))
+                self._follow = max(rms, self._follow * self.release)
+                if max(self._peaks) >= self.healthy_peak or self._follow <= 1e-6:
+                    want = 1.0
+                else:
+                    want = min(max(self.target_rms / self._follow, 1.0), self.max_gain)
+                # 降增益立刻生效（防削顶），升增益慢慢来（防抽吸）
+                self.gain = want if want < self.gain else min(want, self.gain * self.max_rise)
+                out[i] = blk * self.gain
+            processed = np.clip(out, -1.0, 1.0).reshape(-1).astype(np.float32)
+        # 不足一帧的余数用当前增益放行，绝不吞样本
+        tail = self._buf * self.gain
+        self._buf = np.zeros(0, dtype=np.float32)
+        if len(tail):
+            tail = np.clip(tail, -1.0, 1.0).astype(np.float32)
+            return np.concatenate([processed, tail]) if len(processed) else tail
+        return processed
 
 
 class AlsaMic(AudioSource):

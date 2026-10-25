@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import numpy as np
 
 from .models import ModelSpec
@@ -86,15 +88,27 @@ class OfflineASR:
 
     流式模型为了赶实时会牺牲一点准确率，句子结束后用非流式模型重跑一遍
     通常更准（尤其是中文），代价是这一句要多花几十到几百毫秒。
+
+    ``sense_voice`` 是 SenseVoice 多语种模型（中英日韩粤）。它的卖点是
+    **抗背景噪声/音乐**——有实测称嘈杂环境下掉点明显小于 zipformer 系，
+    所以「电视/会议/远场」这类场景值得优先拿它做重识别。
     """
 
-    def __init__(self, spec: ModelSpec, num_threads: int = 2):
+    def __init__(self, spec: ModelSpec, num_threads: int = 2, language: str = "auto"):
         import sherpa_onnx
 
         self.spec = spec
         if spec.kind in ("paraformer", "paraformer_offline"):
             self._recognizer = sherpa_onnx.OfflineRecognizer.from_paraformer(
                 paraformer=spec.model, tokens=spec.tokens, num_threads=num_threads
+            )
+        elif spec.kind == "sense_voice":
+            self._recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+                model=spec.model,
+                tokens=spec.tokens,
+                num_threads=num_threads,
+                language="" if language in ("", "auto") else language,
+                use_itn=True,
             )
         elif spec.kind == "transducer":
             self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
@@ -114,4 +128,16 @@ class OfflineASR:
         stream = self._recognizer.create_stream()
         stream.accept_waveform(sample_rate=sample_rate, waveform=samples)
         self._recognizer.decode_stream(stream)
-        return stream.result.text.strip()
+        text = stream.result.text.strip()
+        if self.spec.kind == "sense_voice":
+            # SenseVoice 会在文本前带上 <|zh|><|NEUTRAL|><|Speech|> 这类标记
+            text = _strip_sense_voice_tags(text)
+        return text
+
+
+_SV_TAG = re.compile(r"<\|[^|]*\|>")
+
+
+def _strip_sense_voice_tags(text: str) -> str:
+    """去掉 SenseVoice 输出里的 <|zh|><|NEUTRAL|><|Speech|><|withitn|> 标记。"""
+    return _SV_TAG.sub("", text).strip()

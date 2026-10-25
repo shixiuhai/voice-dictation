@@ -72,6 +72,12 @@ REGISTRY: dict[str, tuple[str, str, str]] = {
         "ctc",
         "中文小型 CTC 流式模型，21 MB，最快，但只支持中文",
     ),
+    "sense-voice": (
+        "asr/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09",
+        "sense_voice",
+        "SenseVoice 多语种（中英日韩粤），int8 非流式，抗噪/抗背景音乐比 zipformer 强，"
+        "常用于嘈杂环境与整句重识别",
+    ),
     "paraformer-zh": (
         "asr/sherpa-onnx-paraformer-zh-small-2024-03-09",
         "paraformer_offline",
@@ -108,7 +114,7 @@ def detect(directory: Path, name: str, kind: str) -> ModelSpec:
             "decoder": spec.decoder,
             "joiner": spec.joiner,
         }
-    elif kind in ("ctc", "paraformer_offline"):
+    elif kind in ("ctc", "paraformer_offline", "sense_voice"):
         spec.model = _pick(directory, "model")
         spec.files = {"tokens": spec.tokens, "model": spec.model}
     elif kind == "paraformer":
@@ -152,6 +158,8 @@ def _guess_kind(directory: Path) -> str:
     """没登记过的目录，按文件名猜类型。"""
     if _pick(directory, "encoder") and _pick(directory, "joiner"):
         return "transducer"
+    if "sense" in directory.name.lower():
+        return "sense_voice"
     if "paraformer" in directory.name.lower():
         return "paraformer_offline"
     if _pick(directory, "model"):

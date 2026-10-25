@@ -8,6 +8,7 @@
 |---|---|
 | 系统 | Kali GNU/Linux Rolling 2026.2，**WSL2**（内核 `6.18.54.1-microsoft-standard-WSL2`） |
 | CPU / 内存 | 2 vCPU x86_64 / 3.9 GB，无 swap，无 GPU |
+| **内存预算（实测）** | 全部组件在线（VAD+AGC+流式ASR+重识别+标点）进程 RSS 324 MB，加 GTCRN 降噪 333 MB；系统可用还剩 2.1 GB。**内存完全不是瓶颈，卡的是 2 核 CPU —— RTF 才是唯一硬指标** |
 | Windows 宿主 | Windows 11 build 22631，`/mnt/c` 已挂载 |
 | Python | 3.13.12；sherpa-onnx 2.0.0 装在 `~/.local/lib/python3.13/site-packages`（`pip install --user --break-system-packages`） |
 | 仓库位置 | `/home/shixiuhahi/work/voice-dictation`（独立 git 仓库，remote: `ssh://git@ssh.github.com:443/shixiuhai/voice-dictation.git`） |
@@ -49,13 +50,25 @@ WSL2 不透传宿主机声卡。`--source mic` 在这台机器上必然失败，
 
 | 名字 | 类型 | 体积 | RTF（实测，2 线程） |
 |---|---|---|---|
-| `small-bilingual`（默认） | 流式 zipformer 中英双语 | 50 MB | 0.233 |
-| `bilingual` | 流式 zipformer 中英双语 | 198 MB | 0.383 |
-| `zh-14m` | 流式 zipformer 中文 | 25 MB | 0.148 |
-| `ctc-zh` | 流式 CTC 中文 | 26 MB | 0.085 |
-| `paraformer-zh` | **非**流式（整句重识别） | 82 MB | 0.121 |
+| `small-bilingual`（默认） | 流式 zipformer 中英双语 | 50 MB | 0.388 |
+| `bilingual` | 流式 zipformer 中英双语 | 198 MB | **1.565（跟不上实时）** |
+| `zh-14m` | 流式 zipformer 中文 | 25 MB | 0.234 |
+| `ctc-zh` | 流式 CTC 中文 | 26 MB | 0.361 |
+| `paraformer-zh` | **非**流式（整句重识别） | 82 MB | 0.461 |
+| `sense-voice` | **非**流式 SenseVoice 多语种（中英日韩粤） | 165 MB | 待测 |
 
 复现：`python3 scripts/bench.py`（测试音频集是固定的，不同次跑可横向比较）。
+
+**整条链路的实时性**（60s 真实电视剧音频，2 核，**预热后**）：
+流式单独 0.366、含重识别+标点 **0.439 → 约 2.3x 实时，跟得上**。
+⚠️ **首次推理要预热**（含 ONNX 图初始化），单个 chunk 冷启动能测出 RTF 1.2 的假结论。
+
+**别把 `bilingual`（198 MB）当默认**：RTF 1.565 跟不上实时，而且实测识别结果
+并不比 50 MB 的 `small-bilingual` 更好。体积大 ≠ 更准。
+
+`sense-voice` 值得关注：调研显示它**在背景有音乐/噪声的环境下掉点最小**，
+正是「电视/远场」场景该试的模型。用它做重识别：`--refine-model sense-voice`
+（`vd/asr.py` 会剥掉输出里的 `<|zh|><|NEUTRAL|>` 标记）。
 
 **默认是两段式**：流式模型出实时结果，句末用 `paraformer-zh` 重跑整句。
 流式模型会漏字、会偶发空结果，重识别这一遍就是用来兜底的——
@@ -123,6 +136,38 @@ WSL2 不透传宿主机声卡。`--source mic` 在这台机器上必然失败，
 - **AudioContext 可能是 suspended**：`ws.onopen` 回调不是用户手势，
   在那里创建的 `AudioContext` 可能停在 `suspended`，那样会一直在采空气、
   一句都不出。`setupAudio()` 里要显式 `ctx.resume()`。
+- **音源太轻是「识别不出来」的头号原因，实测过两次**：
+  Silero VAD 的 `threshold` 判的是「语音概率」而不是电平，输入一轻，
+  概率整体偏低、阈值跨不过去，表现是**一句都不出**。实测 `samples/1.wav`
+  逐级衰减：-55 dBFS 开始漏字，-61 dBFS 起 0 句；补上增益后到 -79 dBFS 仍正常。
+  用户真实录的电视剧音频（`/tmp/vd_tv_system.wav`，示意）RMS -47.6 / 峰值 -27.6 dBFS，
+  VAD 覆盖率只有 **9%**；归一化后覆盖 59.7s/60s。
+- **电平归一化默认开着**（`vd/audio.py:LevelNormalizer`，`--no-agc` 关，`--agc-max-gain` 默认 64 = +36 dB）：
+  只做两件事：**只在整体偏轻时才补**（最近 5 秒内出现过 ≥0.1 的峰值就锁死在 1.0，
+  语音帧逐采样不变），**只补不削**（增益夹在 [1, max_gain]）。
+  降增益立刻生效（防削顶）、升增益每帧最多 2 倍（防抽吸）。
+  别改成「瞬时电平对目标值归一化」——那样正常语音句间的停顿会被补上近 20 倍
+  增益，`today is 礼拜二` 会识别成 `today is li 巴 a`（踩过这个坑）。
+- **连续有声的音频（电视/直播）VAD 切不出句，只能靠 `max_speech_duration` 兜底**：
+  实测电视剧音频上 `min_silence_duration` 从 0.3 调到 0.15 **完全没作用**（16000 Hz
+  下 Silero VAD 的窗口只有 32ms，0.15s 根本不是有效档位），segment 数一个不变。
+  真正起作用的是 `--vad-max-speech`：默认 30s 时 60 秒只剩 2 段、每段 29.8s
+  （要等 30 秒才出第一句，看起来就像「不识别」）；调到 8s 出 7 段，
+  首句约 8 秒就出来，识别准确率没有损失（实测 8s/12s 的 CER 都在 5~7%）。
+  所以默认改成 **8 秒**。
+- **GTCRN 流式降噪在这台机器上不能用**：合成音频上它把相似度从 0.58 拉到 0.88，
+  但真实电视剧音频上 RTF = **1.29（比实时还慢）**，而且降完电平没变
+  （降噪模型会调整音量，但 `healthy_peak` 是绝对阈值，归一化器只看原始电平），
+  VAD 覆盖率反而 13% → 5%。**用户要真打算上降噪，得先解决 RTF**：
+  要么把降噪放到独立进程/错峰，要么只对 VAD 判定用降噪后的音频。
+- **VAD 切句比「当前段」短，连续音频会丢 12~20%**：实测 45s 连续语音+底噪，
+  定稿段只覆盖 80~88% 的音频。VAD 门槛一低（`min_silence_duration` 0.6）
+  丢得少一些，但切句变粗。这是 VAD 的固有行为，不是 bug。
+- **VAD 默认值**（`vd/vad.py`）：threshold 0.35、min_silence 0.3s、
+  max_speech **8s**，命令行可调（`--vad-threshold` / `--vad-silence` / `--vad-max-speech`）。
+  阈值 0.35 比 sherpa 默认的 0.5 更容易切出句子，代价是底噪多时可能多切几句。
+- **`finalize()` 会先补 100 ms 静音**：输入突然断掉时识别器还欠着音频没吐字。
+  注意这段静音也要过一遍归一化器（否则静音被放大成假语音）。
 - **页面的主题是 CSS 变量**（`vd/mic_client.html`）：`:root` 是深色，
   `[data-theme="light"]` 覆盖同一批变量（30 个，两边一一对应）。
   规则里**不要再写死颜色**——加新颜色先加变量，两套主题都要给值。

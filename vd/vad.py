@@ -36,10 +36,10 @@ class SpeechVAD:
         self,
         model_path: str,
         sample_rate: int = 16000,
-        threshold: float = 0.5,
+        threshold: float = 0.35,
         min_silence_duration: float = 0.3,
         min_speech_duration: float = 0.2,
-        max_speech_duration: float = 20.0,
+        max_speech_duration: float = 8.0,
         num_threads: int = 1,
     ):
         import sherpa_onnx

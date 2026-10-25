@@ -47,7 +47,14 @@ python3 dictation.py --source ws --port 8765
 python3 dictation.py --file samples/1.wav                # 听写仓库自带的测试音频
 python3 dictation.py --source pulse --device RDPSource   # 抓 Windows 会话的音频
 python3 dictation.py --source tcp --port 8765             # 收别的机器推来的音频
+python3 scripts/capture_audio.py --port 8770             # 采音存 WAV + 电平分析（诊断用）
 ```
+
+> **效果不好先量电平。** `scripts/capture_audio.py` 起一个采音页，
+> 浏览器用 `getDisplayMedia` **数字直采**正在播放的音频（或麦克风），
+> 存成 WAV 并打印电平分布、静音占比、VAD 覆盖率。
+> 实测「识别效果差」绝大多数是音源太轻：用户真实录的电视剧音频 RMS 只有
+> **−47.6 dBFS**（正常语音 −25 左右），VAD 覆盖率只剩 **9%**。
 
 听写记录落在 `transcripts/`，实时输出打在终端上（灰色 `…` 是正在说的半句）。
 
@@ -94,7 +101,118 @@ $ pactl list short sources
 
 ---
 
-## 二、实测环境
+## 二、识别原理与交互流程
+
+### 识别方案：两段式（流式出字 + 句末重识别）
+
+一路音频要经过 6 个环节，**每个环节用的模型都不一样**：
+
+```
+音频 16kHz/单声道/float32
+   │
+   ├─① 电平归一化  LevelNormalizer（纯 numpy，无模型）
+   │     只补不削：最近 5 秒内出现过够响的内容就按位透传，
+   │     整体偏轻才补增益（默认最多 64 倍 = +36 dB）
+   │
+   ├─② VAD 切句    Silero VAD（630 KB ONNX）
+   │     判「是不是人在说话」，决定一句从哪到哪
+   │     阈值 0.35 / 静音 0.3s / 单句最长 8s（兜底强制切）
+   │
+   ├─③ 流式识别    small-bilingual zipformer transducer（50 MB）
+   │     边走边出字，屏幕上灰色「…」就是它，负责「实时」
+   │
+   ├─④ 句末重识别  paraformer-zh 非流式（82 MB）
+   │     一句说完后把整句重跑一遍，负责「准确」
+   │
+   ├─⑤ 标点恢复    CT-Transformer（138 MB）
+   │     加逗号句号问号
+   │
+   └─⑥ 落盘        txt / md / srt / json，每出一句就重写
+```
+
+**为什么必须两段式**：流式模型为了赶实时会牺牲准确率、甚至漏字。同一段音频：
+
+```
+small-bilingual 单独跑：   [00:00:22 → 00:00:27] 第一句是加。                            ← 只认出一半
+small-bilingual + 重识别： [00:00:22 → 00:00:27] 第一句是个什么时态加了es是一般现代时，对，…  ← 完整
+```
+
+所以 ③ 负责**延迟**（立刻看到字），④ 负责**质量**（几秒后把这一句修正）。
+每句结尾多等零点几秒，对「边说边记」很划算。流式模型偶尔整段给空结果，重识别也正好捞回来。
+
+### 实测：能不能实时
+
+唯一硬指标是 **RTF**（推理耗时 ÷ 音频时长，< 1 才跟得上）。
+
+**用真实电视剧音频跑完整链路（60 秒，2 核，预热后）**：
+
+| 环节 | 耗时 | RTF |
+|---|---|---|
+| 流式识别 | 21.95s | 0.366 |
+| + 整句重识别 + 标点 | 26.37s | **0.439** |
+| 合计 | | **✓ 跟得上（约 2.3x 实时）** |
+
+各模型单独实测（`scripts/bench.py`，2 线程，剔除预热）：
+
+| 模型 | 类型 | 体积 | RTF | 倍速 |
+|---|---|---|---|---|
+| **`small-bilingual`**（默认流式） | zipformer 双语 | 50 MB | **0.233~0.388** | 2.6~4.3x |
+| `bilingual` | zipformer 双语 | 198 MB | 1.565 | **0.6x ✗ 跟不上了** |
+| `zh-14m` | zipformer 14M 中文 | 25 MB | 0.234 | 4.3x |
+| `ctc-zh` | zipformer2 CTC 中文 | 26 MB | 0.361 | 2.8x |
+| `paraformer-zh`（整句重识别） | 非流式 paraformer | 82 MB | 0.461 | 2.2x |
+
+> **首次推理要预热**：第一个 chunk 包含 ONNX 图初始化和内存分配，单独算会得出
+> 「RTF 1.2、跟不上」的假结论。`scripts/bench.py` 和实际运行都跑在长流上，
+> 所以看长音频的稳态值才准。
+>
+> **`bilingual`（198 MB）在这台机器上已经跟不上实时**（RTF 1.57），别当默认用——
+> 它体积是 `small-bilingual` 的 4 倍，但实测识别结果并不更好。
+
+### 交互流程
+
+**浏览器那端的完整链路**（`--source ws`）：
+
+```
+浏览器                          服务端（WSL2）
+  │                                │
+  │ ① GET /  ──────────────────────│  HTTP 线程一绑端口就起，页面秒开（不等模型）
+  │ ② 轮询 GET /api/status ────────│  模型没好 → 页面显示「服务端正在加载模型」
+  │                                │  模型就绪 → WS 握手才接受（之前返回 503）
+  │ ③ GET /ws（WebSocket 升级）────│
+  │ ④ ← {"cmd":"hello", ...} ──────│  连上就推历史内容 + 会话清单 + 状态
+  │                                │
+  │   点「开始说话」                │
+  │ ⑤ getUserMedia 采麦克风         │  只在安全上下文（localhost/https）可用
+  │ ⑥ 16kHz s16le PCM 二进制帧 ───→│  先到的客户端一直占着麦克风，后来的收 superseded
+  │                                │  ⑦ 归一化 → VAD → 流式识别
+  │ ⑧ ← {"cmd":"partial","text"} ──│  半句，灰字原地刷新
+  │ ⑨ ← {"cmd":"segment",...} ─────│  定稿句（重识别+标点后的），带时间戳
+  │                                │  同时写进 transcripts/*.md/.srt/.json
+  │   点「停止」                    │
+  │ ⑩ 关 WebSocket ───────────────→│  服务端收尾，记录已实时落盘
+  │                                │  （默认继续等下一个客户端；--once 才退出）
+```
+
+**命令行那端**（`--file` / `--source mic` / `pulse` / `tcp`）流程一样，
+只是 ①~⑤ 换成了本地取流，没有 ⑧⑨ 的推送，字直接打在终端上。
+
+控制指令走同一条 WebSocket 的文本帧：
+`{"cmd":"name","name":"会议"}` 改名、`{"cmd":"append","stem":"..."}` 接着写历史记录。
+
+### 怎么知道自己跟不跟得上
+
+```sh
+python3 scripts/bench.py            # 各模型单独 RTF
+python3 dictation.py --file x.wav   # 看落盘时间戳 vs 音频时长
+```
+
+实时运行时如果 CPU 吃满、字越出越慢，就是 RTF > 1 了，换更小的模型或
+`--refine-model ""` 关掉重识别。
+
+---
+
+## 三、实测环境
 
 | | |
 |---|---|
@@ -107,18 +225,22 @@ $ pactl list short sources
 
 没有 GPU、只有 2 个核，所以模型选型的唯一标准就是 **RTF（实时率）能不能压住**。
 
-## 三、模型选型（全部实测）
+## 四、模型选型（全部实测）
 
 RTF = 推理耗时 ÷ 音频时长。< 1 才能边听边出字，0.23 就是比实时快 4 倍。
 测试音频固定取双语模型自带的 4 段中英混说音频（约 28 s），2 线程，剔除首次推理的预热开销。
 
 | 模型 | 类型 | 体积 | RTF | 倍速 | 中英混说表现 |
 |---|---|---|---|---|---|
-| **`small-bilingual`**（默认） | 流式 zipformer 双语 | 50 MB | **0.233** | **4.3x** | 中英都能出，英文词形基本正确 |
-| `bilingual` | 流式 zipformer 双语 | 198 MB | 0.383 | 2.6x | 中英都能出，英文全大写、偶有重复 |
-| `zh-14m` | 流式 zipformer 14M 中文 | 25 MB | 0.148 | 6.8x | 中文可用，英文基本认不出 |
-| `ctc-zh` | 流式 zipformer2 CTC 中文 | 26 MB | 0.085 | 11.7x | 最快，英文输出 `<unk>` |
-| `paraformer-zh` | **非**流式 paraformer 中文 | 82 MB | 0.121 | 8.3x | 中文最准，英文能写成小写拉丁词 |
+| **`small-bilingual`**（默认） | 流式 zipformer 双语 | 50 MB | **0.388** | **2.6x** | 中英都能出，英文词形基本正确 |
+| `bilingual` | 流式 zipformer 双语 | 198 MB | 1.565 | **0.6x ✗** | 中英都能出，英文全大写、偶有重复 |
+| `zh-14m` | 流式 zipformer 14M 中文 | 25 MB | 0.234 | 4.3x | 中文可用，英文基本认不出 |
+| `ctc-zh` | 流式 zipformer2 CTC 中文 | 26 MB | 0.361 | 2.8x | 英文输出 `<unk>` |
+| `paraformer-zh` | **非**流式 paraformer 中文 | 82 MB | 0.461 | 2.2x | 中文最准，英文能写成小写拉丁词 |
+| `sense-voice` | **非**流式 SenseVoice 多语种 | 165 MB | 待测 | — | 中英日韩粤，**抗背景噪声/音乐最强** |
+
+> **别用 `bilingual`（198 MB）当默认**：它在这台机器上 RTF 1.565，**已经跟不上实时**，
+> 而且实测识别结果并不比 50 MB 的 `small-bilingual` 更好。体积大 ≠ 更准。
 
 复现：
 
@@ -139,7 +261,7 @@ small-bilingual + 重识别： [00:00:22 → 00:00:27] 第一句是个什么时�
 
 1. **流式模型**（默认 `small-bilingual`）负责实时出字，屏幕上灰色 `…` 不断刷新；
 2. **句末**用非流式 `paraformer-zh` 把整句重跑一遍，准确率明显更好，
-   重识别耗时只有一句的量级（RTF 0.12）。
+   重识别耗时只有一句的量级（RTF 0.46）。
 
 代价是每句结尾多等零点几秒。对「边说边记」这个场景，这笔买卖很划算。
 另外流式模型偶尔会对某一段给出**空结果**（整段无声），重识别这一遍正好把它捞回来。
@@ -149,11 +271,12 @@ small-bilingual + 重识别： [00:00:22 → 00:00:27] 第一句是个什么时�
 ```sh
 python3 dictation.py --model bilingual --refine-model paraformer-zh
 python3 dictation.py --model zh-14m --refine-model ""      # 关掉重识别，只留实时结果
+python3 dictation.py --refine-model sense-voice            # 换 SenseVoice 做整句重识别
 ```
 
 ---
 
-## 四、用法
+## 五、用法
 
 ```sh
 # 1. 装运行库（只需要 sherpa-onnx，自带 onnxruntime，不要 torch）
@@ -184,6 +307,11 @@ python3 dictation.py --source tcp --port 8765            # 收别的机器推来
 | `--out-dir` `--formats` | 输出目录与格式（`txt,md,srt,json`） |
 | `--out-name` | 记录文件名前缀，最终文件名是 `<前缀>-<开始时间>.md`（默认「听写」） |
 | `--no-punct` / `--no-vad` | 关标点 / 关 VAD（改用识别器端点检测切句） |
+| `--agc` / `--no-agc` | 电平归一化开关（**默认开**）。输入偏轻时自动补增益，远场/电视声必需 |
+| `--agc-max-gain` | 最多补多少倍，默认 64（+36 dB） |
+| `--vad-threshold` | VAD 语音判定阈值，默认 0.35（调低更容易切出句子） |
+| `--vad-silence` | 多长静音算一句说完，默认 0.3s |
+| `--vad-max-speech` | 单句最长多少秒强制切一刀，**默认 8s**。电视这种句间没静音的音频全靠它 |
 | `--hotwords` | 热词文件，每行一个词或短语，提升专有名词准确率 |
 | `--threads` | 推理线程数，默认 2 |
 | `--list-devices` / `--list-models` | 列采集设备（ALSA / Pulse / sounddevice）/ 列已下载模型 |
@@ -194,7 +322,7 @@ python3 dictation.py --source tcp --port 8765            # 收别的机器推来
 [00:00:00 → 00:00:05] 这是第二种，第二种叫呃与always o s什么意思啊？
 ```
 
-## 五、输出
+## 六、输出
 
 每次听写生成一组同名文件（`transcripts/听写-20261025-142211.*`）：
 
@@ -287,7 +415,7 @@ python3 scripts/ws_probe.py --file samples/1.wav --realtime
 
 它会打印服务端推回来的每一句（`[segment]`）和半句（`[partial]`）。
 
-## 六、程序结构
+## 七、程序结构
 
 ```
 voice-dictation/
@@ -296,14 +424,16 @@ voice-dictation/
 │   ├── audio.py            音频源：浏览器 WS / ALSA / sounddevice / WAV / stdin / Pulse / TCP
 │   ├── wsserver.py         最小 WebSocket + HTTP 服务端（浏览器麦克风用，无第三方依赖）
 │   ├── mic_client.html     浏览器控制台（getUserMedia → 16k s16le + 实时文字 + 配置）
+│   ├── capture_client.html 浏览器采音页（getDisplayMedia 系统音频 / 麦克风，分析用）
 │   ├── vad.py              Silero VAD 封装，切句
-│   ├── asr.py              流式 + 非流式识别封装
+│   ├── asr.py              流式 + 非流式识别封装（含 SenseVoice）
 │   ├── punct.py            标点恢复（CT-Transformer）
 │   ├── models.py           模型登记表与模型文件自动识别
 │   └── session.py          听写记录落盘（txt/md/srt/json）
 ├── scripts/
 │   ├── download_models.sh  模型下载
 │   ├── send_mic.py         另一台机器把麦克风推过来（Python）
+│   ├── capture_audio.py    浏览器采音存 WAV + 电平/VAD 分析（诊断用）
 │   ├── ws_probe.py         模拟浏览器的 ws 客户端（联调/自测用）
 │   ├── windows_mic_push.ps1  Windows 侧推流（只要 ffmpeg，不要 Python）
 │   └── bench.py            实测各模型 RTF
@@ -318,8 +448,9 @@ voice-dictation/
 └── transcripts/            听写记录（不入库）
 ```
 
-音频源统一输出 16 kHz / 单声道 / float32，切句交给 VAD，
-最终文本 = 流式结果 →（可选）非流式重识别 →（可选）标点。
+音频源统一输出 16 kHz / 单声道 / float32，
+然后 **电平归一化 → VAD 切句 → 流式识别 →（可选）非流式重识别 →（可选）标点**。
+详见[第二节「识别原理与交互流程」](#二识别原理与交互流程)。
 
 ### ws 源的服务端结构
 
@@ -337,7 +468,7 @@ voice-dictation/
 WebSocket 才开始接受握手（没就绪时返回 503，页面自己等）。
 这样「端口先绑定、模型后加载」就不会让浏览器干等。
 
-## 七、坑
+## 八、坑
 
 - **VAD 的「当前段」比「已完成段」长**：已完成段是把尾部静音裁掉之后的版本。
   如果按「已完成段比已喂的多就补喂」去写兜底分支，同一段音频会被识别两遍，
@@ -365,6 +496,18 @@ WebSocket 才开始接受握手（没就绪时返回 503，页面自己等）。
 - **浏览器的安全上下文**：`getUserMedia` 只在 `https` 或 `localhost`/`127.0.0.1` 下可用。
   用 WSL2 的 IP（`http://172.24.x.x:8765/`）打开页面能看能点，但麦克风**开不起来**
   ——这是浏览器的规则，不是本程序的限制。
+- **音源太轻是「识别不出来」的头号原因**：Silero VAD 的阈值判的是「语音概率」而不是
+  电平，输入一轻概率整体偏低、阈值跨不过去，表现是**一句都不出**。
+  用户真实录的电视剧音频 RMS −47.6 / 峰值 −27.6 dBFS，VAD 覆盖率只有 9%；
+  归一化后覆盖 59.7s/60s。默认已开电平归一化（`--no-agc` 关）。
+- **连续有声的音频（电视/直播）VAD 切不出句**：这类音频句间没有真正的静音，
+  `min_silence_duration` 调了没用（16000 Hz 下 Silero 窗口只有 32 ms，0.15s 不是有效档位），
+  只能靠 `--vad-max-speech` 兜底强制切分。默认 30s 时 60 秒只剩 2 段、要等 30 秒才出第一句，
+  看起来就像「不识别」；改成 **8s** 后首句 8 秒出来，准确率无损失。
+- **首次推理必须预热**：第一个 chunk 含 ONNX 图初始化，单独计时会得出
+  「流式 RTF 1.2、跟不上实时」的假结论。真实稳态是 **0.37**，整条链路（含重识别+标点）**0.44**。
+- **GTCRN 流式降噪在这台机器上不能用**：合成音频上把相似度 0.58→0.88 很惊艳，
+  但真实音频上 **RTF 1.29（比实时慢）**，而且降完电平没变，VAD 覆盖率反而 13%→5%。
 - **手写的 WebSocket 服务端**（`vd/wsserver.py`）只实现了最小子集：
   HTTP/1.1 升级握手 + 客户端带掩码的二进制帧。别指望它支持分片扩展、压缩、ping/pong 之外的
   控制帧。
@@ -375,7 +518,7 @@ WebSocket 才开始接受握手（没就绪时返回 503，页面自己等）。
 - **`_reply` 的 body 必须是 bytes**：曾经把 str 传进去，异常被连接处理器吞掉，
   表现是下载接口直接断连接（curl 看到 000 而不是 400）。
 
-## 八、许可与来源
+## 九、许可与来源
 
 - 本仓库代码：Apache-2.0（见 `LICENSE`）。
 - 识别模型、VAD、标点模型：来自 [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)

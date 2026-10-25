@@ -29,6 +29,7 @@ from vd.asr import OfflineASR, StreamingASR
 from vd.audio import (
     SAMPLE_RATE,
     AlsaMic,
+    LevelNormalizer,
     PulseSource,
     RawStdin,
     SoundDeviceMic,
@@ -100,6 +101,40 @@ def parse_args(argv=None):
     )
     p.add_argument("--no-punct", action="store_true", help="不恢复标点")
     p.add_argument("--no-vad", action="store_true", help="不用 VAD，靠识别器的端点检测切句")
+    p.add_argument(
+        "--agc",
+        dest="agc",
+        action="store_true",
+        default=True,
+        help="电平归一化：输入偏轻时自动补增益（远场/电视声必需，默认开）",
+    )
+    p.add_argument("--no-agc", dest="agc", action="store_false", default=argparse.SUPPRESS,
+                   help="关掉电平归一化")
+    p.add_argument(
+        "--agc-max-gain",
+        type=float,
+        default=64.0,
+        help="电平归一化最多补多少倍增益（64 倍 = +36 dB，够救很轻的音源）",
+    )
+    p.add_argument(
+        "--vad-threshold",
+        type=float,
+        default=0.35,
+        help="VAD 语音判定阈值：调低更容易切出句子（转播/音乐底噪多的场合有用）",
+    )
+    p.add_argument(
+        "--vad-silence",
+        type=float,
+        default=0.3,
+        help="多长的静音算一句说完（秒）",
+    )
+    p.add_argument(
+        "--vad-max-speech",
+        type=float,
+        default=8.0,
+        help="单句最长多少秒就强制切一刀。电视/直播这种连续有声、句间没有静音的"
+             "音频，VAD 切不出句，只能靠这个兜底；默认 8 秒（30 秒的话半分钟才出一句）",
+    )
     p.add_argument("--hotwords", default="", help="热词文件，每行一个词/短语")
     p.add_argument("--threads", type=int, default=2, help="推理线程数")
     p.add_argument("--chunk-ms", type=int, default=100, help="每次读取的音频长度（毫秒）")
@@ -191,7 +226,18 @@ def build_source(args):
 class DictationEngine:
     """把音频流转成一句一句的识别结果。"""
 
-    def __init__(self, source, asr, refine, vad, writer, term, punct=None, chunk_ms: int = 100):
+    def __init__(
+        self,
+        source,
+        asr,
+        refine,
+        vad,
+        writer,
+        term,
+        punct=None,
+        chunk_ms: int = 100,
+        normalizer=None,
+    ):
         self.source = source
         self.asr = asr
         self.refine = refine
@@ -200,6 +246,9 @@ class DictationEngine:
         self.term = term
         self.punct = punct
         self.sample_rate = source.sample_rate
+        # 电平归一化只作用在「喂给 VAD 的那一路」，识别拿到的是补过增益的音频。
+        # 它保证等长，所以下面的采样计数 / 时间轴都不用改。
+        self.norm = normalizer
         self._stream = asr.new_stream()
         self._fed = 0  # 当前这句已经喂给识别器的采样数
         self._total = 0  # 已读采样总数
@@ -208,6 +257,12 @@ class DictationEngine:
         self._chunk_ms = chunk_ms
         self._offset = 0.0  # 追加到旧记录时，时间轴要往后平移这么多
         self._last_partial = ""  # 上次推给前端的半句，避免重复刷
+
+    def _chunk(self, chunk: np.ndarray) -> np.ndarray:
+        """原始分片 -> 归一化后的分片。"""
+        if self.norm is not None:
+            return self.norm.process(chunk)
+        return chunk
 
     def _push(self, payload: dict) -> None:
         """把一条事件推给前端（没有前端时是空操作）。"""
@@ -300,6 +355,9 @@ class DictationEngine:
 
     def run(self) -> None:
         for chunk in self.source.chunks(chunk_ms=self._chunk_ms):
+            chunk = self._chunk(chunk)
+            if not len(chunk):
+                continue
             self._total += len(chunk)
             if self.vad is None:
                 self._step_endpoint(chunk)
@@ -379,7 +437,18 @@ class DictationEngine:
             )
 
     def finalize(self) -> None:
-        """输入结束时把最后一句收尾。"""
+        """输入结束时把最后一句收尾。
+
+        先补 100 ms 静音：输入突然断掉时，识别器还欠着一点音频没吐字，
+        VAD 也要靠这点静音才肯把最后一段入队。
+        """
+        tail = self._chunk(np.zeros(int(self.sample_rate * 0.1), dtype=np.float32))
+        if len(tail):
+            self._total += len(tail)
+            if self.vad is None:
+                self._step_endpoint(tail)
+            else:
+                self._step_vad(tail)
         if self.vad is not None:
             cur = self.vad.current
             self.vad.flush()
@@ -455,7 +524,26 @@ def main(argv=None) -> int:
         if not vad_path.is_file():
             term.info(f"找不到 VAD 模型 {vad_path}，改用端点检测切句（--no-vad）")
         else:
-            vad = SpeechVAD(str(vad_path), sample_rate=SAMPLE_RATE, num_threads=1)
+            vad = SpeechVAD(
+                str(vad_path),
+                sample_rate=SAMPLE_RATE,
+                threshold=args.vad_threshold,
+                min_silence_duration=args.vad_silence,
+                max_speech_duration=args.vad_max_speech,
+                num_threads=1,
+            )
+            term.info(
+                f"VAD: 阈值 {args.vad_threshold}，静音 {args.vad_silence}s 切句，"
+                f"单句最长 {args.vad_max_speech}s"
+            )
+
+    normalizer = None
+    if args.agc and vad is not None:
+        # 只在有 VAD 时才有意义：阈值判的是语音概率，电平太低会整体漏检
+        normalizer = LevelNormalizer(sample_rate=SAMPLE_RATE, max_gain=args.agc_max_gain)
+        term.info(f"电平归一化: 开（最多补 {args.agc_max_gain:.0f} 倍 = 有意压低也能识别）")
+    elif args.agc and vad is None:
+        term.info("电平归一化: 跳过（没启用 VAD，用不上）")
 
     punct = None
     if not args.no_punct:
@@ -512,7 +600,8 @@ def main(argv=None) -> int:
         )
 
     engine = DictationEngine(
-        source, asr, refine, vad, writer, term, punct, chunk_ms=args.chunk_ms
+        source, asr, refine, vad, writer, term, punct, chunk_ms=args.chunk_ms,
+        normalizer=normalizer,
     )
     engine._offset = offset
     if hasattr(source, "on_text"):

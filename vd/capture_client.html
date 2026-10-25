@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>采音 · 分析用</title>
+<script>
+  (function () {
+    var t = null;
+    try { t = localStorage.getItem('vd-theme'); } catch (e) {}
+    if (t !== 'light' && t !== 'dark') {
+      t = (window.matchMedia &&
+           window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
+    }
+    document.documentElement.setAttribute('data-theme', t);
+  })();
+</script>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg:#14161a; --panel:#1f2227; --panel-2:#282c31; --panel-3:#33383e;
+    --border:#2f3338; --border-2:#3c4043; --field:#14161a;
+    --text:#e8eaed; --muted:#9aa0a6; --faint:#7d8189;
+    --link:#8ab4f8; --accent:#1a73e8; --accent-hover:#2b7cf0; --on-accent:#fff;
+    --ok:#34a853; --ok-ink:#6ee7a0; --ok-soft:#1e3a26;
+    --warn:#f0c674; --warn-ink:#f0c674; --warn-soft:#3a3320;
+    --err:#ea4335; --err-ink:#f28b82; --err-soft:#3a201e;
+    --danger:#ea4335;
+  }
+  [data-theme="light"] {
+    color-scheme: light;
+    --bg:#f1f3f4; --panel:#fff; --panel-2:#f1f3f4; --panel-3:#e8eaed;
+    --border:#dadce0; --border-2:#c8ccd0; --field:#fff;
+    --text:#202124; --muted:#5f6368; --faint:#6b6f73;
+    --link:#1a73e8; --accent:#1a73e8; --accent-hover:#185abc; --on-accent:#fff;
+    --ok:#188038; --ok-ink:#137333; --ok-soft:#e6f4ea;
+    --warn:#b06000; --warn-ink:#8a6d00; --warn-soft:#fef7e0;
+    --err:#c5221f; --err-ink:#a50e0e; --err-soft:#fce8e6;
+    --danger:#d93025;
+  }
+  * { box-sizing: border-box; }
+  body { font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+         background:var(--bg); color:var(--text); margin:0; padding:24px; }
+  .wrap { max-width:900px; margin:0 auto; }
+  .head { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+  h1 { font-size:20px; margin:0; font-weight:600; }
+  h2 { font-size:13px; color:var(--muted); margin:0 0 10px; font-weight:600;
+       text-transform:uppercase; letter-spacing:.06em; }
+  p.sub { font-size:13px; color:var(--muted); margin:6px 0 20px; line-height:1.6; }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:10px;
+          padding:16px 18px; margin-bottom:14px; }
+  .row { display:flex; gap:10px; align-items:center; margin:0 0 12px; flex-wrap:wrap; }
+  .row:last-child { margin-bottom:0; }
+  .row label { font-size:13px; color:var(--muted); min-width:84px; }
+  button { font-size:14px; padding:9px 18px; border-radius:8px; border:1px solid var(--border-2);
+           background:var(--panel-2); color:var(--text); cursor:pointer; white-space:nowrap; }
+  button:hover:not(:disabled) { background:var(--panel-3); }
+  button.rec { background:var(--danger); border-color:var(--danger); color:#fff; font-weight:600; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:var(--on-accent); }
+  button.primary:hover:not(:disabled) { background:var(--accent-hover); }
+  button.ghost { font-size:13px; padding:7px 13px; background:transparent;
+           border-color:var(--border-2); color:var(--muted); }
+  select { font-size:14px; padding:9px 12px; border-radius:8px; border:1px solid var(--border-2);
+           background:var(--field); color:var(--text); }
+  .pill { font-size:12px; padding:4px 11px; border-radius:99px;
+          background:var(--panel-2); color:var(--muted); white-space:nowrap; }
+  .pill.on { background:var(--ok-soft); color:var(--ok-ink); }
+  .pill.wait { background:var(--warn-soft); color:var(--warn-ink); }
+  .pill.err { background:var(--err-soft); color:var(--err-ink); }
+  #status { font-size:14px; padding:11px 14px; border-radius:8px; background:var(--panel);
+            border-left:3px solid #4b5563; margin-bottom:14px; line-height:1.6; }
+  #status.on { border-left-color:var(--ok); }
+  #status.wait { border-left-color:var(--warn); }
+  #status.err { border-left-color:var(--err); }
+  #meter { height:26px; border-radius:6px; background:var(--bg); border:1px solid var(--border);
+           overflow:hidden; position:relative; }
+  #meterFill { height:100%; width:0%; background:linear-gradient(90deg,#34a853,#f0c674 70%,#ea4335);
+               transition:width .05s linear; }
+  #meterPeak { position:absolute; top:0; bottom:0; width:2px; background:var(--text); left:0; }
+  .big { font-size:26px; font-variant-numeric:tabular-nums; font-weight:600; }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:4px 14px; font-size:13px; color:var(--muted); }
+  .kv b { color:var(--text); font-weight:500; font-variant-numeric:tabular-nums; }
+  .hint { font-size:12px; color:var(--muted); line-height:1.8; }
+  code { background:var(--panel-2); padding:1px 6px; border-radius:4px; font-size:12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="head">
+    <h1>采音 · 分析用</h1>
+    <button id="theme" class="ghost" type="button">切到浅色</button>
+  </div>
+  <p class="sub">把正在播放的音频（或麦克风）原样送到 WSL2 存成 WAV，用来量电平、看静音、分析识别为什么不准。这里不识别，只采集。</p>
+
+  <div id="status">正在连接采集服务…</div>
+
+  <div class="card">
+    <h2>采集</h2>
+    <div class="row">
+      <label for="mode">来源</label>
+      <select id="mode">
+        <option value="display">系统 / 标签页音频（数字直采，无房间混响）</option>
+        <option value="mic">麦克风（跟真实听写链路一样）</option>
+      </select>
+      <button id="toggle" class="primary">开始采集</button>
+      <span id="pillConn" class="pill">未连接</span>
+    </div>
+    <div class="row" id="micRow" style="display:none;">
+      <label for="device">麦克风</label>
+      <select id="device" style="flex:1;min-width:180px;"><option value="">（默认设备）</option></select>
+    </div>
+    <div class="row">
+      <label>电平</label>
+      <div style="flex:1;min-width:240px;">
+        <div id="meter"><div id="meterFill"></div><div id="meterPeak"></div></div>
+      </div>
+      <span id="levelText" style="font-size:12px;color:var(--muted);min-width:120px;">—</span>
+    </div>
+    <div class="row">
+      <label>已采集</label>
+      <span class="big" id="elapsed">0.0s</span>
+      <span style="font-size:12px;color:var(--muted);" id="sent">（0.0 MB 已送达）</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>实时统计</h2>
+    <div class="kv">
+      <span>瞬时电平</span><b id="stRms">—</b>
+      <span>峰值</span><b id="stPeak">—</b>
+      <span>削顶采样</span><b id="stClip">0</b>
+      <span>近 2 秒「有声」占比</span><b id="stSpeech">—</b>
+    </div>
+    <div class="row" style="margin-top:12px;">
+      <button id="reset">清零统计</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>怎么用</h2>
+    <div class="hint">
+      1. 选<b>「系统 / 标签页音频」</b>，点「开始采集」，浏览器会让你选要分享什么 ——<br>
+      &nbsp;&nbsp;&nbsp;选<b>整个屏幕</b>并在左下角勾上<b>「分享系统音频」</b>（Windows 上是这个），
+      或者选<b>那个标签页</b>并勾上「分享标签页音频」。<br>
+      2. 让它放几十秒电视剧（有说话、有配乐、有停顿最理想）。<br>
+      3. 点「停止采集」，WSL2 终端会把 WAV 存好并打印分析。<br><br>
+      <b>两种来源的差别</b>：系统音频是数字直采，拿到的是播放器解出来的原始声音，
+      反映「内容本身有多难」；麦克风会叠加房间混响、距离衰减和麦克风的自动增益，
+      反映「真实听写链路有多难」。两个都录一段最有价值。<br><br>
+      注意：<code>getDisplayMedia</code> 需要在<b>安全上下文</b>下（<code>http://localhost</code> 可以），
+      并且必须由你手动点一下才能发起。
+    </div>
+  </div>
+
+</div>
+
+<script>
+const SR = 16000;
+let ws = null, ctx = null, proc = null, stream = null, gainNode = null;
+let capturing = false, starting = false, pendingStart = false, ready = false;
+let finished = false;         // 本次采集已经收尾（不再自动重连）
+let deviceId = '', retryTimer = null;
+let envProblem = '', note = null;
+let sentBytes = 0, elapsed = 0, clipped = 0, totalSamples = 0;
+let speechFrames = 0, windowFrames = 0, recent = [];
+let peakHold = 0;
+
+const statusEl = document.getElementById('status');
+const btn = document.getElementById('toggle');
+const modeSel = document.getElementById('mode');
+const deviceSel = document.getElementById('device');
+const micRow = document.getElementById('micRow');
+const themeBtn = document.getElementById('theme');
+const pillConn = document.getElementById('pillConn');
+const meterFill = document.getElementById('meterFill');
+const meterPeak = document.getElementById('meterPeak');
+const levelText = document.getElementById('levelText');
+const elapsedEl = document.getElementById('elapsed');
+const sentEl = document.getElementById('sent');
+const stRms = document.getElementById('stRms');
+const stPeak = document.getElementById('stPeak');
+const stClip = document.getElementById('stClip');
+const stSpeech = document.getElementById('stSpeech');
+
+function status(text, cls) { statusEl.textContent = text; statusEl.className = cls || ''; }
+function setPill(el, text, cls) { el.textContent = text; el.className = 'pill' + (cls ? ' ' + cls : ''); }
+function say(text, cls, holdMs) {
+  note = { text: text, cls: cls || '', until: Date.now() + (holdMs || 4000) };
+  status(note.text, note.cls);
+}
+function updateStatus() {
+  if (note && Date.now() < note.until) { status(note.text, note.cls); return; }
+  if (envProblem) { status(envProblem + ' ' + localhostHint(), 'err'); return; }
+  if (capturing) { status('正在采集，放开声音就行。采够了点「停止采集」。', 'on'); return; }
+  if (starting) { status('正在等你在浏览器里选分享目标…', 'wait'); return; }
+  if (!ready) { status('解析 WSL2 侧的采集服务…', 'wait'); return; }
+  status('准备好了，点「开始采集」。', 'on');
+}
+
+// ---------- 主题 ----------
+const THEME_KEY = 'vd-theme';
+function currentTheme() {
+  return document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
+}
+function applyTheme(t, save) {
+  document.documentElement.setAttribute('data-theme', t);
+  if (save !== false) { try { localStorage.setItem(THEME_KEY, t); } catch (e) {} }
+  themeBtn.textContent = currentTheme() === 'light' ? '切到深色' : '切到浅色';
+}
+themeBtn.onclick = () => applyTheme(currentTheme() === 'light' ? 'dark' : 'light');
+applyTheme(currentTheme(), false);
+
+// ---------- 环境自检 ----------
+function micApiProblem() {
+  if (window.isSecureContext === false) return '当前地址不是浏览器的「安全上下文」，采不了音频。';
+  if (!navigator.mediaDevices) return '这个浏览器拿不到 navigator.mediaDevices。';
+  return '';
+}
+function localhostHint() {
+  if (/^(localhost|127\.0\.0\.1|\[::1\])$/i.test(location.hostname)) return '';
+  return '请改用 http://localhost:' + (location.port || '8770') + '/ 打开本页。';
+}
+
+// ---------- WebSocket ----------
+const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+function connect() {
+  if (ws && (ws.readyState === 0 || ws.readyState === 1)) return;
+  setPill(pillConn, '连接中…', 'wait');
+  ws = new WebSocket(proto + '://' + location.host + '/ws');
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => {
+    setPill(pillConn, '已连接', 'on');
+    ready = true;
+    if (pendingStart) { pendingStart = false; startCapture(); }
+    updateStatus();
+  };
+  ws.onmessage = ev => {
+    if (typeof ev.data !== 'string') return;
+    let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+    if (m.cmd === 'hello') { ready = true; setPill(pillConn, '已连接', 'on'); }
+    if (m.cmd === 'superseded') { stopCapture(); say(m.message || '已有别的页面在采集', 'err', 6000); }
+  };
+  ws.onclose = () => {
+    stopCapture();
+    setPill(pillConn, '未连接', 'err');
+    ready = false;
+    if (finished) return;      // 收工了，别再自动重连
+    say('连接断开，2 秒后重连…', 'err', 2500);
+    if (retryTimer) clearTimeout(retryTimer);
+    retryTimer = setTimeout(connect, 2000);
+  };
+  ws.onerror = () => {};
+}
+
+// ---------- 采集 ----------
+async function startCapture() {
+  if (capturing || starting) return;
+  envProblem = micApiProblem();
+  if (envProblem) { say(envProblem + ' ' + localhostHint(), 'err', 8000); updateStatus(); return; }
+  const mode = modeSel.value;
+  const audio = { channelCount: 1, echoCancellation: false, noiseSuppression: false,
+                  autoGainControl: false };
+  starting = true;
+  btn.classList.remove('primary'); btn.classList.add('rec'); btn.textContent = '取消';
+  try {
+    if (mode === 'display') {
+      if (!navigator.mediaDevices.getDisplayMedia) throw new Error('这个浏览器不支持 getDisplayMedia');
+      say('请在弹出的选择框里选「整个屏幕」并勾上「分享系统音频」（或选标签页勾「分享标签页音频」）。', 'wait', 20000);
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: true, audio: { channelCount: 1, echoCancellation: false,
+                              noiseSuppression: false, autoGainControl: false }
+      });
+      if (!stream.getAudioTracks().length) {
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+        throw new Error('分享里没有勾音频轨道——选「整个屏幕」并勾上「分享系统音频」再试');
+      }
+    } else {
+      const a = Object.assign({}, audio);
+      if (deviceId) a.deviceId = { exact: deviceId };
+      stream = await navigator.mediaDevices.getUserMedia({ audio: a });
+      listDevices();
+    }
+    starting = false;
+    setupAudio();
+  } catch (e) {
+    starting = false;
+    resetBtn();
+    say('采集起不来：' + (e && e.message ? e.message : String(e)), 'err', 9000);
+    updateStatus();
+  }
+}
+
+function setupAudio() {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  try { ctx = new AC({ sampleRate: SR }); } catch (e) { try { ctx = new AC(); } catch (e2) { ctx = null; } }
+  if (!ctx) { stopCapture(); say('这个浏览器不支持 Web Audio。', 'err', 8000); return; }
+  if (ctx.state === 'suspended') { try { Promise.resolve(ctx.resume()).catch(() => {}); } catch (e) {} }
+  try {
+    const src = ctx.createMediaStreamSource(stream);
+    gainNode = ctx.createGain();
+    gainNode.gain.value = 1.0;
+    proc = ctx.createScriptProcessor(4096, 1, 1);
+    proc.onaudioprocess = ev => {
+      const f32 = ev.inputBuffer.getChannelData(0);
+      meter(f32);
+      if (!ws || ws.readyState !== 1) return;
+      try {
+        const buf = toInt16(downsample(f32, ctx.sampleRate, SR));
+        ws.send(buf);
+        sentBytes += buf.byteLength;
+      } catch (e) {}
+    };
+    const mute = ctx.createGain();
+    mute.gain.value = 0;
+    src.connect(gainNode); gainNode.connect(proc); proc.connect(mute); mute.connect(ctx.destination);
+  } catch (e) {
+    stopCapture();
+    say('音频链路起不来：' + (e && e.message ? e.message : String(e)), 'err', 8000);
+    return;
+  }
+  capturing = true;
+  btn.classList.remove('primary'); btn.classList.add('rec'); btn.textContent = '停止采集';
+  // 用户直接点浏览器那条「停止共享」也要跟着收
+  stream.getVideoTracks().concat(stream.getAudioTracks()).forEach(t => {
+    t.onended = () => { if (capturing) { stopCapture(); say('共享结束了，采集停止。', '', 4000); updateStatus(); } };
+  });
+  say('正在采集，放开声音就行。采够了点「停止采集」。', 'on', 3000);
+  updateStatus();
+}
+
+function stopCapture() {
+  capturing = false; starting = false;
+  resetBtn();
+  if (proc) { proc.onaudioprocess = null; try { proc.disconnect(); } catch (e) {} proc = null; }
+  if (gainNode) { try { gainNode.disconnect(); } catch (e) {} gainNode = null; }
+  if (stream) { stream.getTracks().forEach(t => { try { t.onended = null; t.stop(); } catch (e) {} }); stream = null; }
+  if (ctx) { try { ctx.close(); } catch (e) {} ctx = null; }
+}
+
+function resetBtn() {
+  btn.textContent = '开始采集';
+  btn.classList.remove('rec'); btn.classList.add('primary');
+}
+
+function meter(f32) {
+  let sum = 0, peak = 0, clip = 0;
+  for (let i = 0; i < f32.length; i++) {
+    const v = f32[i];
+    sum += v * v;
+    const a = Math.abs(v);
+    if (a > peak) peak = a;
+    if (a >= 0.999) clip++;
+  }
+  const rms = Math.sqrt(sum / f32.length);
+  clipped += clip; totalSamples += f32.length;
+  peakHold = Math.max(peak, peakHold * 0.97);
+  recent.push(rms);
+  if (recent.length > 20) recent.shift();
+  const db = v => v <= 1e-9 ? '-∞' : (20 * Math.log10(v)).toFixed(1);
+  const pct = Math.min(100, Math.max(0, (20 * Math.log10(Math.max(rms, 1e-6)) + 60) / 60 * 100));
+  meterFill.style.width = pct + '%';
+  meterPeak.style.left = Math.min(100, Math.max(0,
+    (20 * Math.log10(Math.max(peakHold, 1e-6)) + 60) / 60 * 100)) + '%';
+  levelText.textContent = db(rms) + ' dBFS';
+  stRms.textContent = db(rms) + ' dBFS';
+  stPeak.textContent = db(peakHold) + ' dBFS';
+  stClip.textContent = clipped;
+  const speech = recent.filter(v => v > 0.01).length / recent.length * 100;
+  stSpeech.textContent = speech.toFixed(0) + '%';
+}
+
+function downsample(f32, srcRate, dstRate) {
+  if (srcRate === dstRate) return f32;
+  const ratio = srcRate / dstRate;
+  const outLen = Math.max(1, Math.floor(f32.length / ratio));
+  const out = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const pos = i * ratio, idx = Math.floor(pos), frac = pos - idx;
+    out[i] = (f32[idx] || 0) * (1 - frac) + (f32[idx + 1] || 0) * frac;
+  }
+  return out;
+}
+
+function toInt16(f32) {
+  const buf = new ArrayBuffer(f32.length * 2);
+  const view = new DataView(buf);
+  for (let i = 0; i < f32.length; i++) {
+    let s = f32[i];
+    s = s < -1 ? -1 : (s > 1 ? 1 : s);
+    view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+  }
+  return buf;
+}
+
+function listDevices() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+  navigator.mediaDevices.enumerateDevices().then(list => {
+    const cur = deviceSel.value;
+    deviceSel.innerHTML = '<option value="">（默认设备）</option>';
+    list.filter(d => d.kind === 'audioinput').forEach((d, i) => {
+      const o = document.createElement('option');
+      o.value = d.deviceId; o.textContent = d.label || ('麦克风 ' + (i + 1));
+      deviceSel.appendChild(o);
+    });
+    deviceSel.value = cur;
+  }).catch(() => {});
+}
+
+// ---------- 计时 ----------
+setInterval(() => {
+  if (capturing) elapsed += 0.2;
+  elapsedEl.textContent = elapsed.toFixed(1) + 's';
+  sentEl.textContent = '（' + (sentBytes / 1048576).toFixed(2) + ' MB 已送达）';
+}, 200);
+
+modeSel.onchange = () => { micRow.style.display = modeSel.value === 'mic' ? 'flex' : 'none'; };
+deviceSel.onchange = () => { deviceId = deviceSel.value; };
+document.getElementById('reset').onclick = () => {
+  clipped = 0; totalSamples = 0; sentBytes = 0; elapsed = 0; peakHold = 0; recent = [];
+  stClip.textContent = '0';
+};
+
+btn.onclick = () => {
+  if (capturing) {
+    // 收工：关掉 WebSocket，服务端就立刻落盘 + 出分析，不用再等
+    finished = true;
+    if (retryTimer) clearTimeout(retryTimer);
+    stopCapture();
+    if (ws && ws.readyState <= 1) { try { ws.close(); } catch (e) {} }
+    setPill(pillConn, '已断开', '');
+    status('已停止采集。WSL2 侧已经落盘，去终端看分析。要看结果点这里不放声音也行，刷新页面可再采一次。', 'on');
+    return;
+  }
+  finished = false;
+  pendingStart = true;
+  if (ws && ws.readyState === 1) { pendingStart = false; startCapture(); }
+  else { say('正在连采集服务…', 'wait', 4000); connect(); }
+};
+
+window.addEventListener('beforeunload', () => stopCapture());
+connect();
+setInterval(() => {
+  if (!finished && (!ws || ws.readyState > 1)) connect();
+}, 3000);
+</script>
+</body>
+</html>
