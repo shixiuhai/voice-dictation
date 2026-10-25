@@ -5,23 +5,34 @@
 全程本地推理，不联网、不上传音频。模型用 [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)
 （k2-fsa 的 ONNX 推理运行时），Python 包就一个 `pip install sherpa-onnx`，不带 torch。
 
+> 📖 **核心教程：[`docs/windows-mic-wsl2.md`](docs/windows-mic-wsl2.md)**
+> 在这台 WSL2 上用 **Windows 麦克风**实时听写、保存成 markdown 的完整步骤。
+
 ---
 
 ## 一、现在就能用（当前这台 WSL2）
 
+**Windows 麦克风 → 这台机器识别 → 按对话存成 markdown**，Windows 侧零安装：
+
 ```sh
-cd voice-dictation
+cd /home/shixiuhahi/work/voice-dictation
+python3 dictation.py --source ws --port 8765
+```
 
-# ① 听写仓库自带的测试音频
-python3 dictation.py --file samples/1.wav
+然后在 **Windows 的 Edge/Chrome** 打开 `http://localhost:8765/`，点「开始说话」就出声了
+（浏览器采麦克风 → WebSocket 推回这台机器 → 实时出字 → 落盘）。
+详见 [`docs/windows-mic-wsl2.md`](docs/windows-mic-wsl2.md)。
 
-# ② 抓 Windows 会话的音频来听写（WSLg 的 RDP 采集源）
-python3 dictation.py --source pulse --device RDPSource
+> 文件是**边说边写**的：每识别出一句就重写一遍 `.md` / `.srt` / `.json`，
+> 进程被 kill 也不丢内容。`Ctrl+C` 只是收尾并补上最后一句。
+> 浏览器断开后服务端会继续等（再打开页面可接着说）；想「断开即退出」加 `--once`。
 
-# ③ 让 Windows 那边的麦克风推过来（WSL2 的 localhost 转发默认开着）
-#    WSL2 侧：python3 dictation.py --source tcp --port 8765
-#    Windows 侧：pip install sounddevice numpy
-#                python scripts/send_mic.py --host 127.0.0.1 --port 8765
+其它几种玩法：
+
+```sh
+python3 dictation.py --file samples/1.wav                # 听写仓库自带的测试音频
+python3 dictation.py --source pulse --device RDPSource   # 抓 Windows 会话的音频
+python3 dictation.py --source tcp --port 8765             # 收别的机器推来的音频
 ```
 
 听写记录落在 `transcripts/`，实时输出打在终端上（灰色 `…` 是正在说的半句）。
@@ -50,26 +61,17 @@ $ pactl list short sources
 2	RDPSource	module-rdp-source.c	s16le 1ch 44100Hz	SUSPENDED
 ```
 
-实测能录到连续音频并识别出中文内容，所以 `--source pulse` 是这台机器上最接近「开麦」的用法。
+实测能录到连续音频并识别出中文内容。
 
 > 这台机器没装 `pulseaudio-utils`（要 root），所以我在 `~/.local/opt/pulse/` 放了一份免 root 的
 > `parec` / `pactl`，并已把 `~/.local/opt/pulse/bin` 加进 `~/.bashrc` 的 PATH。
 > 想要系统级安装就 `sudo apt install pulseaudio-utils`。
 
-### 想真正用上麦克风，三条路
-
-| 方案 | 做法 | 代价 |
-|---|---|---|
-| A. Windows 推流到 WSL2 | WSL2 起 `--source tcp`，Windows 跑 `scripts/send_mic.py` | Windows 装 `sounddevice` |
-| B. Windows 端原生跑 | 把这个仓库 clone 到 Windows，`pip install -r requirements.txt`，用 `sounddevice` 后端开麦 | 模型要再下一份到 Windows |
-| C. USB 麦克风透传 | Windows 装 `usbipd-win`，把 USB 麦克风透传进 WSL2 | 要装驱动、改 `.wslconfig` |
-
-A 最省事：模型和算力都在这台机器上，Windows 只当「麦克风」。
-
 ### 音频来源一览
 
 | `--source` | 说明 |
 |---|---|
+| `ws` | **浏览器当麦克风**：托管采集页面，浏览器用 `getUserMedia` 采音频经 WebSocket 推回来。Windows 侧零安装，首选 |
 | `mic` | 本机麦克风。Linux 有 ALSA 采集设备时走 ALSA，否则自动回退到 `sounddevice` 后端（Windows/macOS 用这个） |
 | `file` | 听写音频文件，`--realtime` 可按 1 倍速喂 |
 | `stdin` | 从标准输入读 16 kHz / 单声道 / s16le PCM |
@@ -147,10 +149,11 @@ pip install --user -r requirements.txt
 bash scripts/download_models.sh
 
 # 3. 开听
-python3 dictation.py                                   # 麦克风（无采集设备时会说明原因）
-python3 dictation.py --file samples/1.wav               # 文件（仓库自带两段测试音频）
-python3 dictation.py --source pulse --device RDPSource  # 抓 PulseAudio 采集源
-python3 dictation.py --source tcp --port 8765          # 收别的机器推来的音频
+python3 dictation.py                                    # 麦克风（无采集设备时会说明原因）
+python3 dictation.py --source ws --port 8765             # 浏览器当麦克风（Windows 侧零安装）
+python3 dictation.py --file samples/1.wav                # 文件（仓库自带两段测试音频）
+python3 dictation.py --source pulse --device RDPSource   # 抓 PulseAudio 采集源
+python3 dictation.py --source tcp --port 8765            # 收别的机器推来的音频
 ```
 
 常用参数：
@@ -159,9 +162,11 @@ python3 dictation.py --source tcp --port 8765          # 收别的机器推来�
 |---|---|
 | `--model` | 流式模型名或模型目录（`small-bilingual` / `bilingual` / `zh-14m` / `ctc-zh` / `paraformer-zh`） |
 | `--refine-model` | 整句重识别用的非流式模型，空串关闭 |
-| `--source` | `mic` / `file` / `stdin` / `pulse` / `tcp` |
+| `--source` | `ws` / `mic` / `file` / `stdin` / `pulse` / `tcp` |
 | `--file` `--realtime` | 听写文件；`--realtime` 按 1 倍速喂，用来验证实时链路 |
 | `--device` | `mic` 用 ALSA 设备名（`default`，多麦机器用 `plughw:1,0`）；`pulse` 用 PulseAudio 源名（`default` / `RDPSource`） |
+| `--host` `--port` | `tcp` / `ws` 服务的监听地址与端口，默认 `0.0.0.0:8765` |
+| `--once` | 只服务一个客户端：客户端断开就结束本次听写并退出（`ws` 默认继续等下一个） |
 | `--out-dir` `--formats` | 输出目录与格式（`txt,md,srt,json`） |
 | `--no-punct` / `--no-vad` | 关标点 / 关 VAD（改用识别器端点检测切句） |
 | `--hotwords` | 热词文件，每行一个词或短语，提升专有名词准确率 |
@@ -171,17 +176,39 @@ python3 dictation.py --source tcp --port 8765          # 收别的机器推来�
 终端上正在说的半句是灰色原地刷新，说完的句子带时间戳定格：
 
 ```
-[00:00:00 → 00:00:05] 这是第一种，第二种叫呃与always o s什么意思啊？
+[00:00:00 → 00:00:05] 这是第二种，第二种叫呃与always o s什么意思啊？
 ```
 
 ## 五、输出
 
 每次听写生成一组同名文件（`transcripts/20261025-131531.*`）：
 
+- `.md` — **按对话分段**的听写记录：抬头是会话信息，正文每一句一个 `##` 小节，带起止时间戳
 - `.txt` — 纯文本，一行一句，带起止时间戳，边说边写，Ctrl+C 不丢
-- `.md` — 带抬头信息（模型、来源、句数、语音时长）的听写记录
 - `.srt` — 字幕，可直接挂到视频上
 - `.json` — 结构化：`{"session": {...}, "segments": [{"start", "end", "text"}]}`
+
+`.md` 长这样：
+
+```markdown
+# 语音听写记录
+
+- 开始时间：2026-10-25 14:02:33
+- 句数：14
+- 语音时长：142.6 s
+- 模型：small-bilingual
+- 来源：浏览器麦克风（http://127.0.0.1:8765/）
+
+---
+
+## 00:00:00 → 00:00:05
+
+这是第一种，第二种叫呃与always o s什么意思啊？
+
+## 00:00:06 → 00:00:11
+
+第一句是个什么时态加了es是一般现代时，对，然后把它试测一下商品。
+```
 
 ## 六、程序结构
 
@@ -189,7 +216,9 @@ python3 dictation.py --source tcp --port 8765          # 收别的机器推来�
 voice-dictation/
 ├── dictation.py            CLI 主程序：参数、主循环、实时显示
 ├── vd/
-│   ├── audio.py            音频源：ALSA 麦克风 / WAV / stdin / TCP
+│   ├── audio.py            音频源：浏览器 WS / ALSA / sounddevice / WAV / stdin / Pulse / TCP
+│   ├── wsserver.py         最小 WebSocket 服务端（浏览器麦克风用，无第三方依赖）
+│   ├── mic_client.html     浏览器采集页面（getUserMedia → 16k s16le）
 │   ├── vad.py              Silero VAD 封装，切句
 │   ├── asr.py              流式 + 非流式识别封装
 │   ├── punct.py            标点恢复（CT-Transformer）
@@ -197,8 +226,11 @@ voice-dictation/
 │   └── session.py          听写记录落盘（txt/md/srt/json）
 ├── scripts/
 │   ├── download_models.sh  模型下载
-│   ├── send_mic.py         另一台机器把麦克风推过来
+│   ├── send_mic.py         另一台机器把麦克风推过来（Python）
+│   ├── windows_mic_push.ps1  Windows 侧推流（只要 ffmpeg，不要 Python）
 │   └── bench.py            实测各模型 RTF
+├── docs/
+│   └── windows-mic-wsl2.md 核心教程：WSL2 + Windows 麦克风实时听写
 ├── samples/                两段测试音频（Apache-2.0，来自 sherpa-onnx）
 ├── models/                 模型目录（不入库）
 │   ├── asr/                各 ASR 模型
@@ -234,6 +266,11 @@ voice-dictation/
   `vad.is_speech_detected` 少了括号会拿到 bound method，`if` 恒为真，行为会很怪。
 - **`RDPSource` 录到的是 Windows 会话的音频**：是不是包含麦克风取决于 Windows 那边的
   录音重定向设置，WSL2 侧看不出来。
+- **浏览器端要接一个 gain=0 的节点再连 destination**：`ScriptProcessorNode` 不接到
+  destination 不会被调度；直接接会把自己的麦克风声音放出来。
+- **手写的 WebSocket 服务端**（`vd/wsserver.py`）只实现了最小子集：
+  HTTP/1.1 升级握手 + 客户端带掩码的二进制帧。别指望它支持分片扩展、压缩、ping/pong 之外的
+  控制帧。
 
 ## 八、许可与来源
 

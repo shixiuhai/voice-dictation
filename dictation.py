@@ -34,6 +34,7 @@ from vd.audio import (
     SoundDeviceMic,
     TcpServer,
     WavFile,
+    WebSocketMic,
     list_capture_devices,
     list_pulse_sources,
     list_sounddevice_inputs,
@@ -62,9 +63,9 @@ def parse_args(argv=None):
     )
     p.add_argument(
         "--source",
-        choices=["mic", "file", "stdin", "tcp", "pulse"],
+        choices=["mic", "file", "stdin", "tcp", "pulse", "ws"],
         default="mic",
-        help="音频来源：mic 麦克风 / file 文件 / stdin 标准输入 / tcp 网络推流 / pulse PulseAudio 采集源",
+        help="音频来源：mic 麦克风 / file 文件 / stdin 标准输入 / tcp 网络推流 / pulse PulseAudio 采集源 / ws 浏览器麦克风",
     )
     p.add_argument("--file", default="", help="--source file 时的音频文件")
     p.add_argument(
@@ -89,6 +90,11 @@ def parse_args(argv=None):
     p.add_argument("--vad-model", default="", help="VAD 模型路径")
     p.add_argument("--punct-model", default="", help="标点模型路径")
     p.add_argument("--models-dir", default="", help="模型根目录")
+    p.add_argument(
+        "--once",
+        action="store_true",
+        help="只服务一个客户端：客户端断开就结束本次听写并退出（ws 源默认继续等下一个）",
+    )
     p.add_argument("--list-devices", action="store_true", help="列出录音设备后退出")
     p.add_argument("--list-models", action="store_true", help="列出已下载模型后退出")
     return p.parse_args(argv)
@@ -161,6 +167,8 @@ def build_source(args):
         return RawStdin()
     if args.source == "pulse":
         return PulseSource(args.device or "default")
+    if args.source == "ws":
+        return WebSocketMic(args.host, args.port, once=args.once)
     return TcpServer(args.host, args.port)
 
 
@@ -311,6 +319,19 @@ def main(argv=None) -> int:
         term.info("下载模型: bash scripts/download_models.sh")
         return 2
 
+    # 先把音频源准备好（ws/tcp 会在这里绑定端口），浏览器才不会因为
+    # 模型加载慢而连不上；之后再慢慢加载模型。
+    try:
+        source = build_source(args)
+    except NoCaptureDevice:
+        term.info("系统里没有可用的录音设备，无法直接用本机麦克风。")
+        list_devices(term)
+        return 3
+    except Exception as e:
+        term.info(f"打开音频来源失败: {e}")
+        list_devices(term)
+        return 3
+
     refine = None
     refine_spec = None
     if args.refine_model:
@@ -338,21 +359,12 @@ def main(argv=None) -> int:
         else:
             term.info("找不到标点模型，输出不带标点")
 
-    try:
-        source = build_source(args)
-    except NoCaptureDevice:
-        term.info("系统里没有可用的录音设备，无法直接用本机麦克风。")
-        list_devices(term)
-        return 3
-    except Exception as e:
-        term.info(f"打开音频来源失败: {e}")
-        list_devices(term)
-        return 3
-
     term.info(f"模型: {spec.summary()}")
     if refine_spec is not None:
         term.info(f"整句重识别: {refine_spec.summary()}")
     term.info(f"音频来源: {source.describe()}")
+    if args.source == "ws":
+        term.info("在 Windows 的 Edge/Chrome 里打开上面的地址，点「开始说话」即可")
     term.info("开始听写，Ctrl+C 结束\n")
 
     decoding_method = "greedy_search"

@@ -29,7 +29,11 @@ def _hms(seconds: float, comma: bool = False) -> str:
 
 @dataclass
 class TranscriptWriter:
-    """把一句一句的识别结果写成听写记录文件。"""
+    """把一句一句的识别结果写成听写记录文件。
+
+    所有格式都是**实时落盘**：每加一句就重写一遍 md/srt/json，
+    进程被 kill、浏览器断连也不会丢内容。
+    """
 
     out_dir: Path
     formats: tuple[str, ...] = ("txt", "md", "srt", "json")
@@ -50,6 +54,7 @@ class TranscriptWriter:
                 self._txt.write(f"# {k}: {v}\n")
             self._txt.write("\n")
             self._txt.flush()
+        self._flush_all()
 
     def add(self, start: float, end: float, text: str, refined: bool = False) -> Segment:
         seg = Segment(start=start, end=end, text=text, refined=refined)
@@ -57,23 +62,32 @@ class TranscriptWriter:
         if self._txt:
             self._txt.write(f"[{_hms(start)} --> {_hms(end)}] {text}\n")
             self._txt.flush()
+        self._flush_all()
         return seg
 
+    def _flush_all(self) -> None:
+        """把 md / srt / json 重写一遍，保证磁盘上的内容是最新的。"""
+        if "md" in self.formats:
+            self._write_md()
+        if "srt" in self.formats:
+            self._write_srt()
+        if "json" in self.formats:
+            self._write_json()
+
     def close(self) -> list[Path]:
-        written: list[Path] = []
         if self._txt:
             self._txt.close()
             self._txt = None
-            written.append(self.out_dir / f"{self.stem}.txt")
-        if "md" in self.formats:
-            written.append(self._write_md())
-        if "srt" in self.formats:
-            written.append(self._write_srt())
-        if "json" in self.formats:
-            written.append(self._write_json())
+        self._flush_all()
+        written = []
+        for ext in ("txt", "md", "srt", "json"):
+            path = self.out_dir / f"{self.stem}.{ext}"
+            if path.is_file():
+                written.append(path)
         return written
 
     def _write_md(self) -> Path:
+        """按对话（每一句）分段写成 markdown。"""
         path = self.out_dir / f"{self.stem}.md"
         speech = sum(max(0.0, s.end - s.start) for s in self.segments)
         lines = [
@@ -88,7 +102,7 @@ class TranscriptWriter:
             lines.append(f"- {k}：{v}")
         lines += ["", "---", ""]
         for s in self.segments:
-            lines.append(f"**{_hms(s.start)[:8]} → {_hms(s.end)[:8]}**")
+            lines.append(f"## {_hms(s.start)[:8]} → {_hms(s.end)[:8]}")
             lines.append("")
             lines.append(s.text)
             lines.append("")

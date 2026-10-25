@@ -183,6 +183,45 @@ class SoundDeviceMic(AudioSource):
         return f"声卡输入 {name} @ {self.sample_rate} Hz（sounddevice）"
 
 
+class WebSocketMic(AudioSource):
+    """浏览器当麦克风：网页采音频，WebSocket 推过来。
+
+    这台 WSL2 没有声卡，Windows 上又常常没装 Python / ffmpeg，
+    而 Edge / Chrome 是现成的——所以给了一条零安装的路径：
+    浏览器打开服务端给的页面，点一下就能说话。
+    """
+
+    def __init__(
+        self,
+        host: str = "0.0.0.0",
+        port: int = 8765,
+        sample_rate: int = SAMPLE_RATE,
+        once: bool = False,
+    ):
+        from .wsserver import MicWebServer
+
+        page = Path(__file__).with_name("mic_client.html").read_text(encoding="utf-8")
+        self._server = MicWebServer(
+            host=host, port=port, page=page, sample_rate=sample_rate, once=once
+        )
+        self.sample_rate = sample_rate
+
+    @property
+    def address(self) -> tuple[str, int]:
+        return self._server.address
+
+    def chunks(self, chunk_ms: int = 100) -> Iterator[np.ndarray]:
+        yield from self._server.chunks(chunk_ms=chunk_ms)
+
+    def close(self) -> None:
+        self._server.close()
+
+    def describe(self) -> str:
+        host, port = self.address
+        shown = "127.0.0.1" if host in ("0.0.0.0", "") else host
+        return f"浏览器麦克风（http://{shown}:{port}/）"
+
+
 class PulseSource(AudioSource):
     """从 PulseAudio / PipeWire 的采集源录音。
 

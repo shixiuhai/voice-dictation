@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>语音听写 · 麦克风输入</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+         background:#14161a; color:#e8eaed; margin:0; padding:32px; }
+  h1 { font-size:20px; margin:0 0 6px; font-weight:600; }
+  p.sub { color:#9aa0a6; font-size:13px; margin:0 0 24px; }
+  #status { font-size:15px; padding:10px 14px; border-radius:8px;
+            background:#1f2227; border-left:3px solid #4b5563; margin-bottom:18px; }
+  #status.on  { border-left-color:#34a853; }
+  #status.err { border-left-color:#ea4335; }
+  button { font-size:15px; padding:10px 20px; border-radius:8px; border:1px solid #3c4043;
+           background:#1f2227; color:#e8eaed; cursor:pointer; }
+  button:hover { background:#2a2d33; }
+  button.rec { background:#ea4335; border-color:#ea4335; color:#fff; }
+  .box { margin-top:22px; padding:14px 16px; border-radius:8px; background:#1f2227;
+         font-size:13px; line-height:1.7; color:#bdc1c6; }
+  code { background:#2a2d33; padding:1px 6px; border-radius:4px; font-size:12px; }
+</style>
+</head>
+<body>
+<h1>语音听写 · 麦克风输入</h1>
+<p class="sub">浏览器采集麦克风，实时推到 WSL2 里的听写程序；识别结果保存在 WSL2 侧的 transcripts/ 目录。</p>
+
+<div id="status">正在连接…</div>
+<button id="toggle">开始说话</button>
+
+<div class="box">
+  1. 点「开始说话」，允许浏览器使用麦克风<br>
+  2. 正常说话，WSL2 终端里会实时出字<br>
+  3. 说完点「停止」，听写记录已写入 WSL2 的 <code>transcripts/</code> 目录<br><br>
+  注意：浏览器采到的是 <b>16 kHz 单声道</b> PCM；已关掉回声消除与降噪，
+  需要关掉的话是浏览器/驱动层面的事，这里默认保留原始人声。
+</div>
+
+<script>
+const SR = 16000;
+let ws = null, ctx = null, proc = null, stream = null, micOn = false, retryTimer = null;
+let userStopped = false;   // 用户主动点了「停止」就不再自动重连
+
+const statusEl = document.getElementById('status');
+const btn = document.getElementById('toggle');
+
+function status(text, cls) {
+  statusEl.textContent = text;
+  statusEl.className = cls || '';
+}
+
+function connect() {
+  userStopped = false;
+  status('正在连接听写服务…');
+  ws = new WebSocket('ws://' + location.host + '/ws');
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { status('已连接，正在打开麦克风…'); startMic(); };
+  ws.onclose = () => {
+    stopMic(false);
+    if (userStopped) {
+      status('已停止。听写记录已保存在 WSL2 侧');
+      return;
+    }
+    // 服务端可能还在加载模型（第一次打开很容易赶在前面），隔两秒重连
+    status('连接断开，2 秒后重试…（也可以在 WSL2 终端 Ctrl+C 结束）', 'err');
+    if (retryTimer) clearTimeout(retryTimer);
+    retryTimer = setTimeout(connect, 2000);
+  };
+  ws.onerror = () => {};
+}
+
+function startMic() {
+  navigator.mediaDevices.getUserMedia({
+    audio: {
+      channelCount: 1,
+      echoCancellation: false,
+      noiseSuppression: false,
+      autoGainControl: false
+    }
+  }).then(s => { stream = s; setupAudio(); })
+    .catch(e => status('打不开麦克风：' + e.message, 'err'));
+}
+
+function setupAudio() {
+  try {
+    ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SR });
+  } catch (e) {
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  const src = ctx.createMediaStreamSource(stream);
+  proc = ctx.createScriptProcessor(4096, 1, 1);
+  proc.onaudioprocess = ev => {
+    if (!ws || ws.readyState !== 1) return;
+    const f32 = ev.inputBuffer.getChannelData(0);
+    ws.send(toInt16(downsample(f32, ctx.sampleRate, SR)));
+  };
+  const mute = ctx.createGain();
+  mute.gain.value = 0;              // 别把麦克风声音放出来
+  src.connect(proc);
+  proc.connect(mute);
+  mute.connect(ctx.destination);    // ScriptProcessor 必须接到 destination 才会被调度
+  micOn = true;
+  btn.textContent = '停止';
+  btn.classList.add('rec');
+  status('正在录音，WSL2 终端会实时出字', 'on');
+}
+
+function stopMic(closeWs) {
+  micOn = false;
+  btn.textContent = '开始说话';
+  btn.classList.remove('rec');
+  if (proc) { proc.onaudioprocess = null; try { proc.disconnect(); } catch (e) {} proc = null; }
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  if (ctx) { try { ctx.close(); } catch (e) {} ctx = null; }
+  if (closeWs && ws && ws.readyState === 1) ws.close();
+}
+
+function downsample(f32, srcRate, dstRate) {
+  if (srcRate === dstRate) return f32;
+  const ratio = srcRate / dstRate;
+  const outLen = Math.max(1, Math.floor(f32.length / ratio));
+  const out = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const pos = i * ratio;
+    const idx = Math.floor(pos);
+    const frac = pos - idx;
+    const a = f32[idx] || 0;
+    const b = f32[idx + 1] || 0;
+    out[i] = a * (1 - frac) + b * frac;
+  }
+  return out;
+}
+
+function toInt16(f32) {
+  const buf = new ArrayBuffer(f32.length * 2);
+  const view = new DataView(buf);
+  for (let i = 0; i < f32.length; i++) {
+    let s = f32[i];
+    s = s < -1 ? -1 : (s > 1 ? 1 : s);
+    view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+  }
+  return buf;
+}
+
+btn.onclick = () => {
+  if (micOn) {
+    userStopped = true;
+    stopMic(true);          // 关掉 WebSocket，服务端就知道你说完了
+    status('已停止。听写记录已保存在 WSL2 侧');
+  } else {
+    connect();
+  }
+};
+connect();
+</script>
+</body>
+</html>
