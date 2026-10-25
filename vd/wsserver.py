@@ -88,6 +88,8 @@ class MicWebServer:
         self._sock.bind((host, port))
         self._sock.listen(4)
         self._conn: socket.socket | None = None
+        # 浏览器可以用文本帧下发控制指令（比如改记录文件名）
+        self.on_text = None
 
     @property
     def address(self) -> tuple[str, int]:
@@ -173,7 +175,16 @@ class MicWebServer:
                         send_frame(conn, payload, OPCODE_PONG)
                         continue
                     if opcode == OPCODE_TEXT:
-                        print(f"[WS] 收到文本: {payload[:100]!r}", flush=True)
+                        text = payload.decode("utf-8", errors="replace")
+                        print(f"[WS] 收到文本: {text[:100]!r}", flush=True)
+                        if self.on_text is not None:
+                            try:
+                                reply = self.on_text(text)
+                            except Exception as e:  # 控制指令出错不该拖垮听写
+                                print(f"[WS] 处理文本帧失败: {e}", flush=True)
+                                reply = None
+                            if reply:
+                                send_frame(conn, reply.encode("utf-8"), OPCODE_TEXT)
                         continue
                     buf.extend(payload)
                     while len(buf) >= want:

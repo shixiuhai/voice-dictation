@@ -78,6 +78,11 @@ def parse_args(argv=None):
     p.add_argument("--realtime", action="store_true", help="读文件时按 1 倍速喂数据")
     p.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR), help="听写记录输出目录")
     p.add_argument(
+        "--out-name",
+        default="",
+        help="记录文件名前缀，最终文件名是 <前缀>-<开始时间>.md（默认「听写」）",
+    )
+    p.add_argument(
         "--formats",
         default="txt,md,srt,json",
         help="输出文件格式，逗号分隔（txt/md/srt/json）",
@@ -205,6 +210,27 @@ class DictationEngine:
             return
         self.writer.add(start, end, text, refined=refined)
         self.term.segment(start, end, text, refined=refined)
+
+    def handle_control(self, text: str) -> str:
+        """处理浏览器发来的控制指令，返回要回给浏览器的字符串（没有就返回空）。
+
+        目前只有一条：``{"cmd": "name", "name": "会议"}`` —— 改记录文件名。
+        名字会被消毒（去路径、限长），所以外部推过来的东西不会写到任意路径。
+        """
+        import json
+
+        try:
+            msg = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            return ""
+        if not isinstance(msg, dict):
+            return ""
+        if msg.get("cmd") != "name":
+            return ""
+        stem = self.writer.set_name(str(msg.get("name", ""))[:120])
+        path = self.writer.out_dir / (stem + ".md")
+        self.term.info(f"记录文件: {path}")
+        return json.dumps({"cmd": "name_ok", "stem": stem}, ensure_ascii=False)
 
     def run(self) -> None:
         for chunk in self.source.chunks(chunk_ms=self._chunk_ms):
@@ -384,16 +410,20 @@ def main(argv=None) -> int:
     writer = TranscriptWriter(
         out_dir=Path(args.out_dir).expanduser(),
         formats=formats,
+        name=args.out_name,
         meta={
             "模型": spec.name,
             "整句重识别": refine_spec.name if refine_spec else "关闭",
             "来源": source.describe(),
         },
     )
+    term.info(f"记录文件: {writer.out_dir / (writer.stem + '.md')}")
 
     engine = DictationEngine(
         source, asr, refine, vad, writer, term, punct, chunk_ms=args.chunk_ms
     )
+    if hasattr(source, "on_text"):
+        source.on_text = engine.handle_control
     try:
         engine.run()
     except KeyboardInterrupt:

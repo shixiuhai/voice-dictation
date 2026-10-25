@@ -18,6 +18,11 @@
            background:#1f2227; color:#e8eaed; cursor:pointer; }
   button:hover { background:#2a2d33; }
   button.rec { background:#ea4335; border-color:#ea4335; color:#fff; }
+  .row { display:flex; gap:10px; align-items:center; margin:0 0 18px; flex-wrap:wrap; }
+  .row label { font-size:13px; color:#9aa0a6; }
+  input[type=text] { font-size:14px; padding:9px 12px; border-radius:8px; width:260px;
+                     border:1px solid #3c4043; background:#1f2227; color:#e8eaed; }
+  input[type=text]:focus { outline:none; border-color:#8ab4f8; }
   .box { margin-top:22px; padding:14px 16px; border-radius:8px; background:#1f2227;
          font-size:13px; line-height:1.7; color:#bdc1c6; }
   code { background:#2a2d33; padding:1px 6px; border-radius:4px; font-size:12px; }
@@ -28,12 +33,23 @@
 <p class="sub">浏览器采集麦克风，实时推到 WSL2 里的听写程序；识别结果保存在 WSL2 侧的 transcripts/ 目录。</p>
 
 <div id="status">正在连接…</div>
-<button id="toggle">开始说话</button>
+
+<div class="row">
+  <label for="fname">记录文件名</label>
+  <input type="text" id="fname" placeholder="如：会议纪要（可留空）" maxlength="60">
+  <button id="rename" style="font-size:13px; padding:8px 14px;">改名</button>
+</div>
+
+<div class="row">
+  <button id="toggle">开始说话</button>
+</div>
 
 <div class="box">
   1. 点「开始说话」，允许浏览器使用麦克风<br>
   2. 正常说话，WSL2 终端里会实时出字<br>
   3. 说完点「停止」，听写记录已写入 WSL2 的 <code>transcripts/</code> 目录<br><br>
+  文件名规则：<code>&lt;名字&gt;-&lt;开始时间&gt;</code>，例如 <code>会议纪要-20261025-142211.md</code>。
+  名字可以随时改，磁盘上的文件会跟着改名，不会覆盖旧记录。<br><br>
   注意：浏览器采到的是 <b>16 kHz 单声道</b> PCM；已关掉回声消除与降噪，
   需要关掉的话是浏览器/驱动层面的事，这里默认保留原始人声。
 </div>
@@ -45,6 +61,8 @@ let userStopped = false;   // 用户主动点了「停止」就不再自动重�
 
 const statusEl = document.getElementById('status');
 const btn = document.getElementById('toggle');
+const nameInput = document.getElementById('fname');
+const renameBtn = document.getElementById('rename');
 
 function status(text, cls) {
   statusEl.textContent = text;
@@ -57,6 +75,13 @@ function connect() {
   ws = new WebSocket('ws://' + location.host + '/ws');
   ws.binaryType = 'arraybuffer';
   ws.onopen = () => { status('已连接，正在打开麦克风…'); startMic(); };
+  ws.onmessage = ev => {
+    if (typeof ev.data !== 'string') return;
+    try {
+      const m = JSON.parse(ev.data);
+      if (m.cmd === 'name_ok') status('记录文件：' + m.stem + '.md', 'on');
+    } catch (e) { /* 忽略非 JSON 消息 */ }
+  };
   ws.onclose = () => {
     stopMic(false);
     if (userStopped) {
@@ -69,6 +94,14 @@ function connect() {
     retryTimer = setTimeout(connect, 2000);
   };
   ws.onerror = () => {};
+}
+
+function sendName() {
+  if (!ws || ws.readyState !== 1) {
+    status('还没连上听写服务，等两秒再试', 'err');
+    return;
+  }
+  ws.send(JSON.stringify({ cmd: 'name', name: nameInput.value }));
 }
 
 function startMic() {
@@ -143,6 +176,9 @@ function toInt16(f32) {
   }
   return buf;
 }
+
+renameBtn.onclick = sendName;
+nameInput.addEventListener('keydown', e => { if (e.key === 'Enter') sendName(); });
 
 btn.onclick = () => {
   if (micOn) {

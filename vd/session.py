@@ -3,10 +3,31 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+
+DEFAULT_NAME = "听写"
+_TIME_FORMAT = "%Y%m%d-%H%M%S"
+
+
+def sanitize_name(name: str, fallback: str = DEFAULT_NAME) -> str:
+    """把外部给的名字洗成安全的文件名片段。
+
+    浏览器端能把名字推过来，那是外部输入，得当成不可信数据处理：
+    去掉路径分隔符和目录穿越、过滤非法字符与控制字符、限长。
+    """
+    name = (name or "").strip()
+    name = re.sub(r"[\x00-\x1f\x7f]", "", name)
+    name = name.replace("\\", "/").split("/")[-1]
+    name = name.replace("..", "")
+    name = re.sub(r'[<>:"/\\|?*]', "_", name)
+    name = name.strip(". ")
+    if not name:
+        return fallback
+    return name[:60]
 
 
 @dataclass
@@ -33,28 +54,61 @@ class TranscriptWriter:
 
     所有格式都是**实时落盘**：每加一句就重写一遍 md/srt/json，
     进程被 kill、浏览器断连也不会丢内容。
+
+    文件名 = ``<名字>-<开始时间>``（如 ``会议-20261025-142211.md``），
+    名字可以中途改（``set_name``），改名会同步改磁盘上的文件名。
     """
 
     out_dir: Path
     formats: tuple[str, ...] = ("txt", "md", "srt", "json")
     meta: dict = field(default_factory=dict)
+    name: str = ""
 
     def __post_init__(self) -> None:
         self.out_dir = Path(self.out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.started_at = datetime.now()
-        self.stem = self.started_at.strftime("%Y%m%d-%H%M%S")
+        self.name = sanitize_name(self.name)
+        self.stem = f"{self.name}-{self.started_at.strftime(_TIME_FORMAT)}"
         self.segments: list[Segment] = []
         self._txt = None
         if "txt" in self.formats:
             path = self.out_dir / f"{self.stem}.txt"
             self._txt = open(path, "w", encoding="utf-8")
             self._txt.write(f"# 语音听写记录  {self.started_at:%Y-%m-%d %H:%M:%S}\n")
+            self._txt.write(f"# 名称: {self.name}\n")
             for k, v in self.meta.items():
                 self._txt.write(f"# {k}: {v}\n")
             self._txt.write("\n")
             self._txt.flush()
         self._flush_all()
+
+    @property
+    def paths(self) -> list[Path]:
+        return [
+            self.out_dir / f"{self.stem}.{ext}"
+            for ext in ("txt", "md", "srt", "json")
+            if (self.out_dir / f"{self.stem}.{ext}").is_file()
+        ]
+
+    def set_name(self, name: str) -> str:
+        """改名字：把磁盘上的文件一起改名，返回最终的文件名主干。
+
+        时间戳保持不变，所以「会议」改成「评审」不会跟别的记录撞名。
+        """
+        new_name = sanitize_name(name, fallback=self.name)
+        if new_name == self.name:
+            return self.stem
+        old_stem = self.stem
+        self.name = new_name
+        self.stem = f"{self.name}-{self.started_at.strftime(_TIME_FORMAT)}"
+        for ext in ("txt", "md", "srt", "json"):
+            old = self.out_dir / f"{old_stem}.{ext}"
+            new = self.out_dir / f"{self.stem}.{ext}"
+            if old.is_file() and not new.exists():
+                old.replace(new)
+        self._flush_all()
+        return self.stem
 
     def add(self, start: float, end: float, text: str, refined: bool = False) -> Segment:
         seg = Segment(start=start, end=end, text=text, refined=refined)
@@ -79,12 +133,7 @@ class TranscriptWriter:
             self._txt.close()
             self._txt = None
         self._flush_all()
-        written = []
-        for ext in ("txt", "md", "srt", "json"):
-            path = self.out_dir / f"{self.stem}.{ext}"
-            if path.is_file():
-                written.append(path)
-        return written
+        return self.paths
 
     def _write_md(self) -> Path:
         """按对话（每一句）分段写成 markdown。"""
@@ -93,6 +142,7 @@ class TranscriptWriter:
         lines = [
             "# 语音听写记录",
             "",
+            f"- 名称：{self.name}",
             f"- 开始时间：{self.started_at:%Y-%m-%d %H:%M:%S}",
             f"- 结束时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
             f"- 句数：{len(self.segments)}",
@@ -123,6 +173,7 @@ class TranscriptWriter:
         path = self.out_dir / f"{self.stem}.json"
         payload = {
             "session": {
+                "name": self.name,
                 "started_at": self.started_at.isoformat(timespec="seconds"),
                 "ended_at": datetime.now().isoformat(timespec="seconds"),
                 "segments": len(self.segments),

@@ -207,12 +207,20 @@ class WebSocketMic(AudioSource):
         self.sample_rate = sample_rate
 
     @property
+    def on_text(self):
+        """浏览器用文本帧下发控制指令（改文件名等）时的回调。"""
+        return self._server.on_text
+
+    @on_text.setter
+    def on_text(self, fn):
+        self._server.on_text = fn
+
+    @property
     def address(self) -> tuple[str, int]:
         return self._server.address
 
     def chunks(self, chunk_ms: int = 100) -> Iterator[np.ndarray]:
         yield from self._server.chunks(chunk_ms=chunk_ms)
-
     def close(self) -> None:
         self._server.close()
 
