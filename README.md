@@ -90,7 +90,7 @@ $ pactl list short sources
 | `file` | 听写音频文件，`--realtime` 可按 1 倍速喂 |
 | `stdin` | 从标准输入读 16 kHz / 单声道 / s16le PCM |
 | `pulse` | 抓 PulseAudio 采集源，`--device` 指定源名（`default` / `RDPSource`） |
-| `tcp` | 监听 TCP，收别的机器推来的 PCM |
+| `tcp` | 监听 TCP，收别的机器推来的 PCM（裸 16 kHz s16le 或整个 WAV 文件都行）。客户端断开后继续等下一个，不用重启服务端 |
 
 ---
 
@@ -180,7 +180,7 @@ python3 dictation.py --source tcp --port 8765            # 收别的机器推来
 | `--file` `--realtime` | 听写文件；`--realtime` 按 1 倍速喂，用来验证实时链路 |
 | `--device` | `mic` 用 ALSA 设备名（`default`，多麦机器用 `plughw:1,0`）；`pulse` 用 PulseAudio 源名（`default` / `RDPSource`） |
 | `--host` `--port` | `tcp` / `ws` 服务的监听地址与端口，默认 `0.0.0.0:8765` |
-| `--once` | 只服务一个客户端：客户端断开就结束本次听写并退出（`ws` 默认继续等下一个） |
+| `--once` | 只服务一个客户端：客户端断开就结束本次听写并退出（`ws` / `tcp` 默认继续等下一个） |
 | `--out-dir` `--formats` | 输出目录与格式（`txt,md,srt,json`） |
 | `--out-name` | 记录文件名前缀，最终文件名是 `<前缀>-<开始时间>.md`（默认「听写」） |
 | `--no-punct` / `--no-vad` | 关标点 / 关 VAD（改用识别器端点检测切句） |

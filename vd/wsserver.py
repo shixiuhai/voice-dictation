@@ -497,3 +497,8 @@ class MicWebServer:
                 piece = bytes(buf[:want])
                 del buf[:want]
                 yield np.frombuffer(piece, dtype=np.int16).astype(np.float32) / 32768.0
+        # 断开前最后那点零头也要送出去，别白白丢掉最后几百毫秒
+        if len(buf) % 2:
+            buf = buf[:-1]
+        if buf:
+            yield np.frombuffer(bytes(buf), dtype=np.int16).astype(np.float32) / 32768.0

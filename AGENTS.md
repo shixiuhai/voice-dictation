@@ -85,6 +85,15 @@ WSL2 不透传宿主机声卡。`--source mic` 在这台机器上必然失败，
   旧记录读不回来时会退化到解析 `.txt` / `.md`（`load_session()` 三级兜底）。
 - **`--source ws` 断开后继续等下一个客户端**（`--once` 才退出）。这是有意的：
   浏览器关掉再打开能接着说，同一个记录文件。
+- **`--source tcp` 也一样**：客户端断开后继续等下一个（`--once` 才退出），
+  客户端崩了不用重启服务端重新加载模型。客户端断开时服务端会**补 0.5 秒静音**，
+  让 VAD 把当前这句结掉（下一句从头开始），不然最后一句永远出不来。
+- **TCP 源当字节流看，不假设客户端送来的一定对齐**：多出来的半个采样先攒着，
+  凑成整采样再送进识别器；流结束时剩下那半个采样丢掉（以前直接 `np.frombuffer`
+  报 `buffer size must be a multiple of element size`，整个听写进程崩掉）。
+  `stdin` 源有同样的坑，也修了。
+- **TCP 源能直接收 WAV 文件**（`cat a.wav | nc`）：开头是 RIFF 头就跳过，
+  采样率不是 16 kHz 顺手线性重采样，立体声降混。头没收全就继续攒字节。
 - **端口先绑定、模型后加载**：`main()` 里先 `build_source()`（`ws`/`tcp` 在这里 bind），
   再加载模型。否则浏览器打开得太早会连不上。现在页面还会自己重试，两边都兜住。
 - **ws 源的 HTTP 与 WS 是分开的线程**（`vd/wsserver.py`）：
@@ -129,6 +138,11 @@ WSL2 不透传宿主机声卡。`--source mic` 在这台机器上必然失败，
   否则同一段被识别两遍（会出现「昨天是MONDAY，昨天是MONDAY。」）。
   正确做法：用 `current_segment.start` 跟踪当前段。
 - **`vad.is_speech_detected` 是方法不是属性**，少写括号 → 拿到 bound method → `if` 恒为真。
+- **VAD 一旦 `flush()` 过就不再认新音频**（sherpa-onnx 的行为，实测）：
+  之后再喂多少音频，`is_speech_detected()` 都是 False，`current_segment.start` 永远是 -1。
+  `reset()` 能救回来，但**采样计数器会归零**（段起点又从 0 开始算，时间戳就乱了）。
+  所以中途要收尾就**补一段静音**（0.5 秒就够，VAD 的 `min_silence_duration` 是 0.3），
+  让它自然结段，别 flush / reset。
 - **`sherpa_onnx.Alsa` 打开失败会直接 `exit(-1)`**（C++ 侧行为，Python 拦不住）。
   必须在开设备之前先用 `/proc/asound/pcm` 探测有没有采集设备。
 - **带热词必须用 `modified_beam_search`**，sherpa-onnx 会直接抛错（程序里已自动切换）。

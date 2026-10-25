@@ -109,7 +109,7 @@ def parse_args(argv=None):
     p.add_argument(
         "--once",
         action="store_true",
-        help="只服务一个客户端：客户端断开就结束本次听写并退出（ws 源默认继续等下一个）",
+        help="只服务一个客户端：客户端断开就结束本次听写并退出（ws / tcp 源默认继续等下一个）",
     )
     p.add_argument("--list-devices", action="store_true", help="列出录音设备后退出")
     p.add_argument("--list-models", action="store_true", help="列出已下载模型后退出")
@@ -185,7 +185,7 @@ def build_source(args):
         return PulseSource(args.device or "default")
     if args.source == "ws":
         return WebSocketMic(args.host, args.port, once=args.once)
-    return TcpServer(args.host, args.port)
+    return TcpServer(args.host, args.port, once=args.once)
 
 
 class DictationEngine:

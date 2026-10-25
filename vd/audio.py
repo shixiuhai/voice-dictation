@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import socket
+import struct
 import sys
 import time
 import wave
@@ -16,6 +17,12 @@ from typing import Iterator
 import numpy as np
 
 SAMPLE_RATE = 16000
+
+# WAV 头最多攒这么多字节；还认不出来就当裸 PCM 处理
+_WAV_HEAD_MAX = 4096
+
+# 客户端断开时补多少秒静音，好让 VAD 把当前这句结掉
+_TAIL_SILENCE = 0.5
 
 
 def resample_linear(samples: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
@@ -380,6 +387,10 @@ class RawStdin(AudioSource):
                 block = bytes(buf[: n * 2])
                 del buf[: n * 2]
                 yield np.frombuffer(block, dtype=np.int16).astype(np.float32) / 32768.0
+        # 剩下的零头：半个采样凑不成 int16，丢掉（不然 frombuffer 直接报错）
+        if len(buf) % 2:
+            print("[stdin] 结尾多出 1 个字节（凑不成整采样），已丢弃", flush=True)
+            del buf[-1:]
         if buf:
             yield np.frombuffer(bytes(buf), dtype=np.int16).astype(np.float32) / 32768.0
 
@@ -387,43 +398,176 @@ class RawStdin(AudioSource):
         return "标准输入（16 kHz s16le PCM）"
 
 
+def _wav_data_chunk(buf: bytes) -> tuple[int, int, int] | None:
+    """解析 WAV 文件头，返回 (数据段起点, 采样率, 声道数)。
+
+    - ``None``：头还没收全，继续攒字节
+    - 采样率 ``0``：是 WAV，但格式认不了（不是 16 bit PCM），交给调用方处理
+    """
+    pos = 12  # RIFF....WAVE
+    rate = 0
+    channels = 0
+    while pos + 8 <= len(buf):
+        cid = buf[pos : pos + 4]
+        size = struct.unpack("<I", buf[pos + 4 : pos + 8])[0]
+        body = pos + 8
+        if cid == b"fmt ":
+            if body + 16 > len(buf):
+                return None
+            _, channels, rate, _, _, bits = struct.unpack(
+                "<HHIIHH", buf[body : body + 16]
+            )
+            # 只认 16 bit、1~8 声道，别的当不了（免得畸形文件把内存吃光）
+            if bits != 16 or channels <= 0 or channels > 8:
+                rate = 0
+        elif cid == b"data":
+            if rate < 8000 or rate > 192000:
+                rate = 0
+            return body, rate, channels
+        pos = body + size + (size & 1)
+    return None
+
+
 class TcpServer(AudioSource):
-    """监听 TCP，接受一个客户端推送 16 kHz / 单声道 / s16le PCM。
+    """监听 TCP，接受客户端推送 16 kHz / 单声道 / s16le PCM。
 
     用于「麦克风在别的机器上、识别在这台机器上」的场景，例如手机 App
     或者另一台装了声卡的电脑，通过 ``scripts/send_mic.py`` 把音频推过来。
+
+    收到的当字节流看，**不假设客户端送来的一定对齐**：多出来的半个采样先
+    攒着，凑成整采样再交给识别器，流结束时剩下那半个采样丢掉（不会崩）。
+
+    客户端断开后继续等下一个（``once=True`` 才退出），跟 ws 源一个脾气——
+    客户端崩了不用重启服务端重新加载模型。
+
+    客户端直接把 WAV 文件推过来也行（``cat a.wav | nc``）：开头是 RIFF 头
+    就跳过，采样率不是 16 kHz 顺手重采样。
     """
 
-    def __init__(self, host: str = "0.0.0.0", port: int = 8765, sample_rate: int = SAMPLE_RATE):
+    def __init__(
+        self,
+        host: str = "0.0.0.0",
+        port: int = 8765,
+        sample_rate: int = SAMPLE_RATE,
+        once: bool = False,
+    ):
         self.sample_rate = sample_rate
+        self.once = once
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sock.bind((host, port))
-        self._sock.listen(1)
+        self._sock.listen(5)
 
     def chunks(self, chunk_ms: int = 100) -> Iterator[np.ndarray]:
-        print(f"[TCP] 等待客户端连接 {self._sock.getsockname()[:2]} ...", flush=True)
-        conn, addr = self._sock.accept()
-        print(f"[TCP] 已连接 {addr[0]}:{addr[1]}", flush=True)
         n = max(1, int(self.sample_rate * chunk_ms / 1000))
+        while True:
+            yield from self._session(n)
+            if self.once:
+                return
+            print("[TCP] 客户端断开，继续等下一个（Ctrl+C 结束）", flush=True)
+
+    def _session(self, n: int) -> Iterator[np.ndarray]:
+        """服务一个客户端，直到它断开。"""
+        print(f"[TCP] 等待客户端连接 {self._sock.getsockname()[:2]} ...", flush=True)
+        try:
+            conn, addr = self._sock.accept()
+        except OSError:
+            return
+        print(f"[TCP] 已连接 {addr[0]}:{addr[1]}", flush=True)
+
         buf = bytearray()
+        src_rate = self.sample_rate  # 收到的字节按这个采样率解释
+        channels = 1
+        pending = True  # 开头几个字节还没判断是不是 WAV 头
         try:
             while True:
-                data = conn.recv(n * 2)
+                try:
+                    data = conn.recv(65536)
+                except ConnectionResetError:
+                    print("[TCP] 客户端被强制断开", flush=True)
+                    break
                 if not data:
                     break
                 buf.extend(data)
-                while len(buf) >= n * 2:
-                    block = bytes(buf[: n * 2])
-                    del buf[: n * 2]
-                    yield np.frombuffer(block, dtype=np.int16).astype(np.float32) / 32768.0
-            if buf:
-                yield np.frombuffer(bytes(buf), dtype=np.int16).astype(np.float32) / 32768.0
+
+                if pending:
+                    if len(buf) < 4:
+                        continue
+                    if buf[:4] != b"RIFF":
+                        pending = False
+                    elif len(buf) < 12:
+                        continue
+                    elif buf[8:12] != b"WAVE":
+                        pending = False
+                    else:
+                        info = _wav_data_chunk(bytes(buf))
+                        if info is None:
+                            if len(buf) < _WAV_HEAD_MAX:
+                                continue
+                            print("[TCP] WAV 头太大，按裸 PCM 处理", flush=True)
+                            pending = False
+                        else:
+                            offset, rate, ch = info
+                            if rate == 0:
+                                print(
+                                    "[TCP] 只支持 16 bit PCM 的 WAV，这个文件按裸 PCM 处理",
+                                    flush=True,
+                                )
+                                pending = False
+                            else:
+                                del buf[:offset]
+                                src_rate = rate
+                                channels = ch
+                                pending = False
+                                if rate != self.sample_rate:
+                                    print(
+                                        f"[TCP] 客户端推的是 {rate} Hz，"
+                                        f"正在重采样到 {self.sample_rate} Hz",
+                                        flush=True,
+                                    )
+
+                frames = max(channels, (n // channels) * channels)
+                need = frames * channels * 2
+                while len(buf) >= need:
+                    block = bytes(buf[:need])
+                    del buf[:need]
+                    yield self._to_samples(block, src_rate, channels)
+
+            # 流结束了，处理剩下的零头
+            if pending:
+                print("[TCP] 客户端只推来一个残缺的 WAV 头，已丢弃", flush=True)
+                buf.clear()
+            elif buf:
+                tail = len(buf) % (channels * 2)
+                if tail:
+                    print(
+                        f"[TCP] 结尾多出 {tail} 个字节（凑不成整采样），已丢弃",
+                        flush=True,
+                    )
+                    del buf[-tail:]
+                if buf:
+                    yield self._to_samples(bytes(buf), src_rate, channels)
+
+            # 补一段静音，让 VAD 把当前这句结掉：sherpa-onnx 的 VAD 一旦
+            # flush 过就不再认新音频，只能靠静音自然收尾（下一个客户端接新的一句）
+            yield np.zeros(int(self.sample_rate * _TAIL_SILENCE), dtype=np.float32)
         finally:
             conn.close()
 
+    def _to_samples(self, block: bytes, src_rate: int, channels: int) -> np.ndarray:
+        """一整块原始字节 -> 单声道 float32（必要时降混 + 重采样）。"""
+        data = np.frombuffer(block, dtype=np.int16).astype(np.float32) / 32768.0
+        if channels > 1:
+            data = data.reshape(-1, channels).mean(axis=1)
+        if src_rate != self.sample_rate:
+            data = resample_linear(data, src_rate, self.sample_rate)
+        return data
+
     def close(self) -> None:
-        self._sock.close()
+        try:
+            self._sock.close()
+        except OSError:
+            pass
 
     def describe(self) -> str:
         return f"TCP 推流 {self._sock.getsockname()[:2]}"
