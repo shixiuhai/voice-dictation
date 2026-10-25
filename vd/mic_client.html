@@ -617,7 +617,10 @@ function startMic() {
 
   let p;
   try {
-    p = navigator.mediaDevices.getUserMedia(audio);
+    // 约束要放在 audio 键下面：getUserMedia({audio: {...}})，
+    // 直接把约束当顶层传过去会被浏览器拒掉
+    // （At least one of audio and video must be requested）
+    p = navigator.mediaDevices.getUserMedia({ audio: audio, video: false });
   } catch (e) {
     // 非安全上下文 / 老浏览器：这里会同步抛异常，必须兜住，
     // 否则异常逃出事件处理函数，页面看起来就是「点了没反应」
