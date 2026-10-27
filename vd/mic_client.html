@@ -127,9 +127,17 @@
           overflow-anchor:none; }
   .seg { display:flex; gap:12px; padding:7px 0; border-bottom:1px solid var(--hairline);
          font-size:15px; line-height:1.65; }
+  /* 时间戳列不允许收缩：它带 white-space:nowrap，一旦被 flex 压窄
+     （min-width 比实际内容还小），文字会溢出盒子盖到右边的识别文字上。
+     flex:0 0 auto 让它按内容宽度占位，短时间戳靠 min-width 对齐成一列。 */
   .seg .ts { color:var(--faint); font-size:11px; font-variant-numeric:tabular-nums;
-             white-space:nowrap; padding-top:4px; min-width:78px; }
-  .seg .txt { white-space:pre-wrap; word-break:break-word; }
+             white-space:nowrap; padding-top:4px; flex:0 0 auto; min-width:78px; }
+  .seg .txt { white-space:pre-wrap; word-break:break-word; flex:1 1 auto; min-width:0; }
+  /* 窄屏（手机/半屏）放不下「时间戳 | 文字」两列时改成上下堆叠，避免挤压换行 */
+  @media (max-width:560px) {
+    .seg { flex-direction:column; gap:2px; }
+    .seg .ts { padding-top:0; min-width:0; }
+  }
   .seg.refined .txt { color:var(--text-strong); }
   .seg .txt { color:var(--text); }
   .seg.live-seg { border-bottom:none; }
