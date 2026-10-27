@@ -43,6 +43,11 @@ class AudioSource:
 
     sample_rate = SAMPLE_RATE
 
+    # 会话代次：ws / tcp 这类「客户端断开后还能接下一个」的源，每来一个新
+    # 客户端就 +1。引擎靠它判断「换人了」，把跨连接复用的识别状态清掉
+    # （否则上一条连接的残留文本会串到下一条连接）。
+    session = 0
+
     def chunks(self, chunk_ms: int = 100) -> Iterator[np.ndarray]:
         raise NotImplementedError
 
@@ -327,6 +332,11 @@ class WebSocketMic(AudioSource):
     @on_text.setter
     def on_text(self, fn):
         self._server.on_text = fn
+
+    @property
+    def session(self) -> int:
+        """会话代次，每换一个麦克风客户端 +1。"""
+        return self._server.session
 
     @property
     def address(self) -> tuple[str, int]:

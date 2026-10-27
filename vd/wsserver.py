@@ -45,6 +45,9 @@ _ALLOWED_DOWNLOAD_EXT = (".md", ".txt", ".srt", ".json")
 # 放进音频队列表示「输入到此为止」，客户端断开时用
 _EOF = object()
 
+# 客户端断开时补这么多秒静音，让识别器把当前这句收尾（同 vd/audio.py 的 TCP 源）
+_TAIL_SILENCE = 0.5
+
 
 def _recv_exact(conn: socket.socket, n: int) -> bytes:
     buf = b""
@@ -152,6 +155,7 @@ class MicWebServer:
         self._lock = threading.Lock()
         self._clients: list[_Client] = []
         self._sender: _Client | None = None
+        self._session = 0  # 会话代次，每换一个麦克风客户端 +1
         self._audio: queue.Queue = queue.Queue()
         self._stopped = threading.Event()
         self._ready = False
@@ -169,6 +173,12 @@ class MicWebServer:
     @property
     def address(self) -> tuple[str, int]:
         return self._sock.getsockname()[:2]
+
+    @property
+    def session(self) -> int:
+        """会话代次，每换一个麦克风客户端 +1。"""
+        with self._lock:
+            return self._session
 
     def close(self) -> None:
         self._stopped.set()
@@ -391,9 +401,17 @@ class MicWebServer:
             with self._lock:
                 if client in self._clients:
                     self._clients.remove(client)
-                if self._sender is client:
+                was_sender = self._sender is client
+                if was_sender:
                     self._sender = None
             client.close()
+            if was_sender:
+                # 补一段静音让当前这句自然收尾：跟 TCP 源一个道理，
+                # 断开时识别器还欠着音频没吐字，不补的话最后一句永远出不来。
+                # （final 模式靠静音触发断句，VAD 模式靠静音结段。）
+                self._audio.put(
+                    b"\x00" * (int(self.sample_rate * _TAIL_SILENCE) * 2)
+                )
             print(
                 "[WS] 浏览器断开，记录已实时保存（再打开页面可继续，Ctrl+C 结束）",
                 flush=True,
@@ -463,6 +481,7 @@ class MicWebServer:
         with self._lock:
             if self._sender is None:
                 self._sender = client
+                self._session += 1  # 换人了：引擎据此清掉跨连接复用的状态
             is_sender = self._sender is client
         if not is_sender:
             if not client.told_takeover:

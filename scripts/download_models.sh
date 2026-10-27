@@ -57,7 +57,7 @@ wanted() { # wanted <名字>；不传参数表示全要
 
 TARGETS=("$@")
 if [ ${#TARGETS[@]} -eq 0 ]; then
-  TARGETS=(small-bilingual zh-14m ctc-zh paraformer-zh bilingual)
+  TARGETS=(small-bilingual zh-14m ctc-zh paraformer-zh bilingual x-asr)
 fi
 
 echo "== 流式 / 非流式 ASR 模型 =="
@@ -78,8 +78,13 @@ for t in "${TARGETS[@]}"; do
     paraformer-zh)
       download_asr "$t" "paraformer-zh-small-2024-03-09"
       ;;
+    x-asr)
+      # X-ASR：单模型流式方案的首选，标点/大小写烤进词表、能给 token 打时间戳。
+      # 480ms chunk 的中英版（160ms 版也有，见 models.py 的 REGISTRY）。
+      download_asr "$t" "x-asr-480ms-streaming-zipformer-transducer-zh-en-punct-int8-2026-06-05"
+      ;;
     *)
-      echo "  未知模型名: $t（可选: small-bilingual bilingual zh-14m ctc-zh paraformer-zh）"
+      echo "  未知模型名: $t（可选: small-bilingual bilingual zh-14m ctc-zh paraformer-zh x-asr）"
       ;;
   esac
 done

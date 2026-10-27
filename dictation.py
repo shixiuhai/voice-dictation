@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -41,8 +42,12 @@ from vd.audio import (
     list_sounddevice_inputs,
 )
 from vd.punct import Punctuator
+from vd.final import FinalCommitter, Sentence, normalize_cjk_spacing
 from vd.session import Terminal, TranscriptWriter, list_sessions
 from vd.vad import SpeechVAD
+
+# 断句落在标点前面时，新句开头会粘上标点，把它挪回上一句
+_LEADING_PUNCT = re.compile(r"^[，。！？；：、,.!?;:]+")
 
 DEFAULT_OUT_DIR = Path(__file__).resolve().parent / "transcripts"
 
@@ -101,6 +106,31 @@ def parse_args(argv=None):
     )
     p.add_argument("--no-punct", action="store_true", help="不恢复标点")
     p.add_argument("--no-vad", action="store_true", help="不用 VAD，靠识别器的端点检测切句")
+    p.add_argument(
+        "--commit",
+        choices=["vad", "final"],
+        default="vad",
+        help="切句方式：vad 先用 VAD 切段再识别（默认）；final 一个模型搞定——"
+             "流式识别一直吃连续音频，用 token 时间戳判断「这段已经定型」就落盘",
+    )
+    p.add_argument(
+        "--final-margin",
+        type=float,
+        default=1.0,
+        help="final 模式：token 的时间戳比当前音频位置早多少秒就算定型（秒）",
+    )
+    p.add_argument(
+        "--final-pause",
+        type=float,
+        default=1.2,
+        help="final 模式：说话停顿超过多少秒就断句（模型不带标点时靠这个）",
+    )
+    p.add_argument(
+        "--final-max-sentence",
+        type=float,
+        default=30.0,
+        help="final 模式：单句最长多少秒就强制断句",
+    )
     p.add_argument(
         "--agc",
         dest="agc",
@@ -223,7 +253,63 @@ def build_source(args):
     return TcpServer(args.host, args.port, once=args.once)
 
 
-class DictationEngine:
+class ControlMixin:
+    """浏览器发来的控制指令（改名 / 追加到已有记录 / 列记录）。
+
+    两个引擎都要用，抽出来放前面。
+    """
+
+    def handle_control(self, text: str) -> str:
+        """处理浏览器发来的控制指令，返回要回给浏览器的字符串（没有就返回空）。
+
+        - ``{"cmd": "name", "name": "会议"}`` —— 改记录文件名
+        - ``{"cmd": "append", "stem": "会议-20261025-142211"}`` —— 追加到已有记录
+        - ``{"cmd": "list"}`` —— 列已有记录
+
+        名字和文件名主干都来自浏览器，是外部输入：
+        ``sanitize_name`` / ``sanitize_stem`` 负责消毒，这里只做调度。
+        """
+        import json
+
+        try:
+            msg = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            return ""
+        if not isinstance(msg, dict):
+            return ""
+
+        cmd = msg.get("cmd")
+        if cmd == "name":
+            stem = self.writer.set_name(str(msg.get("name", ""))[:120])
+            path = self.writer.out_dir / (stem + ".md")
+            self.term.info(f"记录文件: {path}")
+            return json.dumps({"cmd": "name_ok", "stem": stem}, ensure_ascii=False)
+
+        if cmd == "append":
+            try:
+                offset = self.writer.attach(str(msg.get("stem", "")))
+            except (ValueError, FileNotFoundError) as e:
+                return json.dumps({"cmd": "error", "message": str(e)}, ensure_ascii=False)
+            self._offset = offset
+            path = self.writer.out_dir / (self.writer.stem + ".md")
+            self.term.info(f"追加到: {path}（时间轴从 {offset:.1f}s 接着走）")
+            return json.dumps(
+                {"cmd": "append_ok", "stem": self.writer.stem, "offset": offset},
+                ensure_ascii=False,
+            )
+
+        if cmd == "list":
+            return json.dumps(
+                {
+                    "cmd": "sessions",
+                    "items": list_sessions(self.writer.out_dir, exclude=self.writer.stem),
+                },
+                ensure_ascii=False,
+            )
+        return ""
+
+
+class DictationEngine(ControlMixin):
     """把音频流转成一句一句的识别结果。"""
 
     def __init__(
@@ -305,53 +391,8 @@ class DictationEngine:
         )
 
     def handle_control(self, text: str) -> str:
-        """处理浏览器发来的控制指令，返回要回给浏览器的字符串（没有就返回空）。
-
-        - ``{"cmd": "name", "name": "会议"}`` —— 改记录文件名
-        - ``{"cmd": "append", "stem": "会议-20261025-142211"}`` —— 追加到已有记录
-        - ``{"cmd": "list"}`` —— 列已有记录
-
-        名字和文件名主干都来自浏览器，是外部输入：
-        ``sanitize_name`` / ``sanitize_stem`` 负责消毒，这里只做调度。
-        """
-        import json
-
-        try:
-            msg = json.loads(text)
-        except (json.JSONDecodeError, TypeError):
-            return ""
-        if not isinstance(msg, dict):
-            return ""
-
-        cmd = msg.get("cmd")
-        if cmd == "name":
-            stem = self.writer.set_name(str(msg.get("name", ""))[:120])
-            path = self.writer.out_dir / (stem + ".md")
-            self.term.info(f"记录文件: {path}")
-            return json.dumps({"cmd": "name_ok", "stem": stem}, ensure_ascii=False)
-
-        if cmd == "append":
-            try:
-                offset = self.writer.attach(str(msg.get("stem", "")))
-            except (ValueError, FileNotFoundError) as e:
-                return json.dumps({"cmd": "error", "message": str(e)}, ensure_ascii=False)
-            self._offset = offset
-            path = self.writer.out_dir / (self.writer.stem + ".md")
-            self.term.info(f"追加到: {path}（时间轴从 {offset:.1f}s 接着走）")
-            return json.dumps(
-                {"cmd": "append_ok", "stem": self.writer.stem, "offset": offset},
-                ensure_ascii=False,
-            )
-
-        if cmd == "list":
-            return json.dumps(
-                {
-                    "cmd": "sessions",
-                    "items": list_sessions(self.writer.out_dir, exclude=self.writer.stem),
-                },
-                ensure_ascii=False,
-            )
-        return ""
+        """见 ``ControlMixin.handle_control``。"""
+        return super().handle_control(text)
 
     def run(self) -> None:
         for chunk in self.source.chunks(chunk_ms=self._chunk_ms):
@@ -459,6 +500,161 @@ class DictationEngine:
                       self._total / self.sample_rate + self._offset, None, text)
 
 
+class FinalEngine(ControlMixin):
+    """单模型听写：一条流式识别流到底，自己判断定型并落盘。
+
+    和 ``DictationEngine`` 的区别：
+
+    - 音频**不切段**，识别器一直吃连续流，每句都有左上下文；
+    - 不需要 VAD，也不需要额外的离线模型：识别器自己给出每个 token 的
+      时间戳，够老的就是定型了的（见 ``vd/final.py``）；
+    - 提交过的文字不再修改（final 的意思），实时预览显示的是当前这句。
+
+    前提是识别模型自带标点（``--model x-asr``）。模型不带标点时，
+    断句就退化成「按说话停顿断」，可以再挂一个标点模型兜底。
+    """
+
+    def __init__(
+        self,
+        source,
+        asr,
+        writer,
+        term,
+        punct=None,
+        chunk_ms: int = 100,
+        normalizer=None,
+        margin: float = 1.0,
+        pause: float = 1.2,
+        max_sentence: float = 30.0,
+    ):
+        self.source = source
+        self.writer = writer
+        self.term = term
+        self.punct = punct
+        self.norm = normalizer
+        self.sample_rate = source.sample_rate
+        self._chunk_ms = chunk_ms
+        self._offset = 0.0
+        self._last_partial = ""
+        self._held: Sentence | None = None  # 暂存一句，等下一句来了再落盘
+        self._asr = asr
+        self._commit_kwargs = dict(
+            sample_rate=self.sample_rate,
+            margin=margin,
+            pause=pause,
+            max_sentence=max_sentence,
+        )
+        self._commit = FinalCommitter(asr, **self._commit_kwargs)
+        # ws / tcp 断开后还能接下一个客户端：换人时必须把这条复用的识别流扔掉，
+        # 否则上一条连接的残留假设会当成新连接的输出吐出来（串台）。
+        self._session = getattr(source, "session", 0)
+        # 换会话收尾时把上一条连接最后几句落盘，但别再推给新客户端
+        self._mute_push = False
+
+    def _chunk(self, chunk: np.ndarray) -> np.ndarray:
+        if self.norm is not None:
+            return self.norm.process(chunk)
+        return chunk
+
+    def _push(self, payload: dict) -> None:
+        try:
+            self.source.push_event(payload)
+        except Exception:
+            pass
+
+    def _push_partial(self, text: str) -> None:
+        if text == self._last_partial:
+            return
+        self._last_partial = text
+        self._push({"cmd": "partial", "text": text})
+
+    def _emit(self, sentence) -> None:
+        """收下一句定稿的话。
+
+        断句常常落在标点前面（模型比音频慢 1~2 秒，句末的逗号会晚一步吐出来），
+        所以这里**晚一句再落盘**：新句开头粘着的标点挪回上一句，
+        上一句才真正写进文件。这样 txt / md / srt / json 的内容始终一致。
+        """
+        text = normalize_cjk_spacing(sentence.text.strip())
+        m = _LEADING_PUNCT.match(text)
+        if m:
+            if self._held is not None:
+                self._held.text = (self._held.text + m.group(0)).strip()
+                self._held.end = max(self._held.end, sentence.start)
+            text = text[m.end() :].strip()
+            if not text:
+                return
+        if not text:
+            return
+        if self._held is not None:
+            self._write(self._held)
+        self._held = Sentence(text, sentence.start, sentence.end)
+
+    def _write(self, sentence: Sentence) -> None:
+        text = sentence.text
+        if self.punct is not None:
+            text = self.punct.add(text).strip()
+            if not text:
+                return
+        start = sentence.start + self._offset
+        end = sentence.end + self._offset
+        self.writer.add(start, end, text, refined=False)
+        self.term.segment(start, end, text, refined=False)
+        self._last_partial = ""
+        if self._mute_push:
+            return
+        self._push(
+            {
+                "cmd": "segment",
+                "start": start,
+                "end": end,
+                "text": text,
+                "refined": False,
+                "count": len(self.writer.segments),
+            }
+        )
+
+    def run(self) -> None:
+        for chunk in self.source.chunks(chunk_ms=self._chunk_ms):
+            # 换客户端了：先把上一条连接的最后一句收尾落盘，再重开一条识别流
+            cur = getattr(self.source, "session", self._session)
+            if cur != self._session:
+                self._session = cur
+                self._reset()
+            chunk = self._chunk(chunk)
+            if not len(chunk):
+                continue
+            pending, sentences = self._commit.feed(chunk)
+            if pending:
+                pending = normalize_cjk_spacing(pending)
+                self.term.partial(pending)
+                self._push_partial(pending)
+            for sentence in sentences:
+                self._emit(sentence)
+        self.finalize()
+
+    def _reset(self) -> None:
+        """换客户端：收尾上一条连接，丢掉跨连接复用的识别流。"""
+        # 上一条连接的最后几句仍然落盘，但不要再推给刚连上的新客户端
+        self._mute_push = True
+        try:
+            for sentence in self._commit.finalize():
+                self._emit(sentence)
+            if self._held is not None:
+                self._write(self._held)
+                self._held = None
+        finally:
+            self._mute_push = False
+        self._commit = FinalCommitter(self._asr, **self._commit_kwargs)
+
+    def finalize(self) -> None:
+        for sentence in self._commit.finalize():
+            self._emit(sentence)
+        if self._held is not None:
+            self._write(self._held)
+            self._held = None
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     if args.file and args.source == "mic":
@@ -507,9 +703,11 @@ def main(argv=None) -> int:
         list_devices(term)
         return 3
 
+    final_mode = args.commit == "final"
+
     refine = None
     refine_spec = None
-    if args.refine_model:
+    if args.refine_model and not final_mode:
         try:
             refine_spec = model_registry.resolve(args.refine_model)
         except (FileNotFoundError, KeyError, ValueError) as e:
@@ -517,9 +715,11 @@ def main(argv=None) -> int:
             refine_spec = None
         if refine_spec is not None:
             refine = OfflineASR(refine_spec, num_threads=args.threads)
+    elif final_mode:
+        term.info("单模型模式：不用整句重识别，识别器自己判断定型")
 
     vad = None
-    if not args.no_vad:
+    if not args.no_vad and not final_mode:
         vad_path = Path(args.vad_model) if args.vad_model else model_registry.vad_model_path()
         if not vad_path.is_file():
             term.info(f"找不到 VAD 模型 {vad_path}，改用端点检测切句（--no-vad）")
@@ -538,20 +738,26 @@ def main(argv=None) -> int:
             )
 
     normalizer = None
-    if args.agc and vad is not None:
+    if args.agc and (vad is not None or final_mode):
         # 只在有 VAD 时才有意义：阈值判的是语音概率，电平太低会整体漏检
         normalizer = LevelNormalizer(sample_rate=SAMPLE_RATE, max_gain=args.agc_max_gain)
         term.info(f"电平归一化: 开（最多补 {args.agc_max_gain:.0f} 倍 = 有意压低也能识别）")
-    elif args.agc and vad is None:
+    elif args.agc:
         term.info("电平归一化: 跳过（没启用 VAD，用不上）")
 
     punct = None
     if not args.no_punct:
-        punct_path = Path(args.punct_model) if args.punct_model else model_registry.punctuation_model_path()
-        if punct_path and punct_path.is_file():
-            punct = Punctuator(str(punct_path))
+        if final_mode and spec.has_punct:
+            # 识别模型自带标点（X-ASR 的 punct 版本），再挂标点模型会重复加标点
+            term.info("标点: 识别模型自带，不再挂额外的标点模型")
         else:
-            term.info("找不到标点模型，输出不带标点")
+            punct_path = (
+                Path(args.punct_model) if args.punct_model else model_registry.punctuation_model_path()
+            )
+            if punct_path and punct_path.is_file():
+                punct = Punctuator(str(punct_path))
+            else:
+                term.info("找不到标点模型，输出不带标点")
 
     term.info(f"模型: {spec.summary()}")
     if refine_spec is not None:
@@ -599,10 +805,23 @@ def main(argv=None) -> int:
             f"（时间轴从 {offset:.1f}s 接着走）"
         )
 
-    engine = DictationEngine(
-        source, asr, refine, vad, writer, term, punct, chunk_ms=args.chunk_ms,
-        normalizer=normalizer,
-    )
+    if final_mode:
+        engine = FinalEngine(
+            source, asr, writer, term, punct, chunk_ms=args.chunk_ms,
+            normalizer=normalizer,
+            margin=args.final_margin,
+            pause=args.final_pause,
+            max_sentence=args.final_max_sentence,
+        )
+        term.info(
+            f"单模型模式: 定型判定 margin {args.final_margin}s，"
+            f"停顿 {args.final_pause}s 断句，单句最长 {args.final_max_sentence}s"
+        )
+    else:
+        engine = DictationEngine(
+            source, asr, refine, vad, writer, term, punct, chunk_ms=args.chunk_ms,
+            normalizer=normalizer,
+        )
     engine._offset = offset
     if hasattr(source, "on_text"):
         source.on_text = engine.handle_control
@@ -613,6 +832,7 @@ def main(argv=None) -> int:
         return {
             "model": spec.name,
             "refine_model": refine_spec.name if refine_spec else "",
+            "commit": args.commit,
             "source": source.describe(),
             "stem": writer.stem,
             "name": writer.name,

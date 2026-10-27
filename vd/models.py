@@ -34,6 +34,11 @@ class ModelSpec:
     joiner: str = ""
     model: str = ""
     modeling_unit: str = "cjkchar"
+    bpe_vocab: str = ""
+    # 空串让 sherpa-onnx 自己从 encoder 推断；只有 X-ASR 系是 zipformer2 布局，
+    # 需要显式指定。写 "transducer" 不是合法值，会让每次加载都打一行警告。
+    model_type: str = ""
+    has_punct: bool = False
     desc: str = ""
     files: dict = field(default_factory=dict)
 
@@ -83,6 +88,12 @@ REGISTRY: dict[str, tuple[str, str, str]] = {
         "paraformer_offline",
         "中文非流式 paraformer，78 MB，适合整句重识别（校正文稿），不是流式模型",
     ),
+    "x-asr": (
+        "asr/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-punct-int8-2026-06-05",
+        "transducer",
+        "X-ASR 中英流式 zipformer（480ms chunk），标点/大小写烤进词表，0.16B 参数 int8 155 MB，"
+        "单模型方案首选：自带标点、能给每个 token 打时间戳",
+    ),
 }
 
 DEFAULT_MODEL = "small-bilingual"
@@ -100,6 +111,19 @@ def _pick(directory: Path, prefix: str) -> str:
     return str(candidates[0])
 
 
+def _tokens_have_punct(tokens: Path) -> bool:
+    """词表里带不带标点。
+
+    X-ASR 的 punct 版本把标点直接烤进了词表，识别结果自带逗号句号，
+    就不需要另外挂标点模型了。
+    """
+    try:
+        text = tokens.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return "。" in text or "，" in text
+
+
 def detect(directory: Path, name: str, kind: str) -> ModelSpec:
     """根据目录内容拼出 ModelSpec。"""
     tokens = directory / "tokens.txt"
@@ -108,12 +132,23 @@ def detect(directory: Path, name: str, kind: str) -> ModelSpec:
         spec.encoder = _pick(directory, "encoder")
         spec.decoder = _pick(directory, "decoder")
         spec.joiner = _pick(directory, "joiner")
+        # BPE 词表（有 bpe.model 说明是子词模型，词表里还可能带标点）
+        bpe = directory / "bpe.model"
+        if bpe.is_file():
+            spec.modeling_unit = "bpe"
+            spec.bpe_vocab = str(bpe)
+        # X-ASR 系是 zipformer2 架构，encoder 的布局不一样，要显式告诉 sherpa-onnx
+        if "x-asr" in directory.name.lower():
+            spec.model_type = "zipformer2"
         spec.files = {
             "tokens": spec.tokens,
             "encoder": spec.encoder,
             "decoder": spec.decoder,
             "joiner": spec.joiner,
         }
+        if spec.bpe_vocab:
+            spec.files["bpe"] = spec.bpe_vocab
+        spec.has_punct = _tokens_have_punct(Path(spec.tokens))
     elif kind in ("ctc", "paraformer_offline", "sense_voice"):
         spec.model = _pick(directory, "model")
         spec.files = {"tokens": spec.tokens, "model": spec.model}

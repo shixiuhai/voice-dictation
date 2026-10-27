@@ -56,6 +56,7 @@ WSL2 不透传宿主机声卡。`--source mic` 在这台机器上必然失败，
 | `ctc-zh` | 流式 CTC 中文 | 26 MB | 0.361 |
 | `paraformer-zh` | **非**流式（整句重识别） | 82 MB | 0.461 |
 | `sense-voice` | **非**流式 SenseVoice 多语种（中英日韩粤） | 165 MB | 待测 |
+| `x-asr` | 流式 zipformer2 中英双语（480ms chunk）**自带标点/大小写** | 155 MB | 短音频 0.90；223s 真实电视剧音频 **1.15（略慢）** |
 
 复现：`python3 scripts/bench.py`（测试音频集是固定的，不同次跑可横向比较）。
 
@@ -73,6 +74,13 @@ WSL2 不透传宿主机声卡。`--source mic` 在这台机器上必然失败，
 **默认是两段式**：流式模型出实时结果，句末用 `paraformer-zh` 重跑整句。
 流式模型会漏字、会偶发空结果，重识别这一遍就是用来兜底的——
 去掉重识别（`--refine-model ""`）质量会明显下降。
+
+**另一条路：单模型 final 模式**（`--commit final` + `--model x-asr`）。
+只用一条流式识别流吃连续音频、永不切段重置，靠「假设文本的稳定前缀」判断
+定型（`vd/final.py`），定型就落盘、不再改。好处：每句都有左上下文（VAD 的
+段边界会丢字）、不用第二个模型、标点是模型词表自带的。模型的 `tokens.txt`
+里带标点就算「自带标点」(`models.py:_tokens_have_punct`)，main 里据此不再挂
+标点模型。RTF 见上表（长音频略超 1，是这条路的主要代价）。
 
 ## 5. 免 root 装的东西
 
@@ -176,6 +184,22 @@ WSL2 不透传宿主机声卡。`--source mic` 在这台机器上必然失败，
   用户手动选过之后就跟系统无关了。
 - **`scripts/ws_probe.py`** 是不开浏览器时模拟浏览器的客户端（手搓 WS 帧），
   用来验证服务端链路。推流末尾要补静音，否则 VAD 不切句、看不到定稿句。
+- **final 模式（`--commit final`，`FinalEngine` + `vd/final.py`）**：
+  - **定型判定 = 局部一致性**：拿当前假设和 `margin`（默认 1s）**之前**的假设
+    比公共前缀，别拿「当前 vs 上一次」比——流式假设是单调追加的，上一次的公共
+    前缀永远等于上一次全长，那样永远判不出定型（实测连续 30s 只出 1 句，
+    其余全堆到 finalize）。跟历史比，才能露出中间被改写的部分。
+  - **靠模型自带标点断句**：`x-asr` 的词表带标点，`spec.has_punct` 为真时
+    main 不再挂标点模型（再挂会重复加标点）。句末标点断的句 `uncertain=False`，
+    靠停顿/超时断的 `uncertain=True`。
+  - **晚一句落盘**：断句常落在标点前面，`FinalEngine._emit` 暂存上一句，等新句
+    开头粘的标点挪回来再写。`.txt`/`.md`/`.srt`/`.json` 保持内容一致。
+  - **换客户端要重置**：ws/tcp 断开后还能接下一个，`FinalCommitter` 那条流不能
+    跨连接复用（否则上一条连接的残留文本会串台）。`AudioSource.session` 每换一个
+    麦克风客户端 +1，`FinalEngine.run` 检测到变化就 `_reset()`——先 finalize 收尾
+    落盘（但 `_mute_push=True`，不推给新客户端），再重建 committer。
+  - **断连补静音**：ws 客户端断开时服务端补 0.5s 静音（`wsserver._TAIL_SILENCE`），
+    逼出最后一句，跟 TCP 源一个道理。
 
 ## 6. 改代码前先知道的坑
 
@@ -195,6 +219,14 @@ WSL2 不透传宿主机声卡。`--source mic` 在这台机器上必然失败，
 - **ws 源的错误分支要小心**：`wsserver._reply()` 的 body 必须是 bytes。
   传了 str 会抛 `TypeError`，而连接处理器会把异常吞掉——表现是下载接口直接断连接
   （curl 看到 000 而不是 400），排查起来很绕。
+- **`OnlineRecognizer.from_transducer` 的 `model_type` 不能写 `"transducer"`**：
+  那会打一行 `Invalid model_type: transducer` 的警告（能跑，但每次加载都刷）。
+  普通 zipformer 传空串让 sherpa-onnx 自己推断，只有 X-ASR 系（zipformer2 布局）
+  才显式传 `"zipformer2"`。`ModelSpec.model_type` 默认就是空串。
+- **X-ASR 系是 BPE 词表 + zipformer2 布局**：`models.py` 若发现目录里有
+  `bpe.model` 就把 `modeling_unit` 设成 `bpe` 并带上 `bpe_vocab`；目录名含
+  `x-asr` 时 `model_type="zipformer2"`。它的输出汉字之间带空格（`昨 天 是`），
+  `final.normalize_cjk_spacing()` 负责去空格、并把中英文标点前后的空格也收干净。
 
 ## 7. 提交与推送
 

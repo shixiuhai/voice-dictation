@@ -238,9 +238,14 @@ RTF = 推理耗时 ÷ 音频时长。< 1 才能边听边出字，0.23 就是比�
 | `ctc-zh` | 流式 zipformer2 CTC 中文 | 26 MB | 0.361 | 2.8x | 英文输出 `<unk>` |
 | `paraformer-zh` | **非**流式 paraformer 中文 | 82 MB | 0.461 | 2.2x | 中文最准，英文能写成小写拉丁词 |
 | `sense-voice` | **非**流式 SenseVoice 多语种 | 165 MB | 待测 | — | 中英日韩粤，**抗背景噪声/音乐最强** |
+| `x-asr` | 流式 zipformer2 双语（480ms chunk） | 155 MB | 0.90~1.15 | 0.9~1.1x | **自带标点/大小写**，中文很准，可单模型实时 |
 
 > **别用 `bilingual`（198 MB）当默认**：它在这台机器上 RTF 1.565，**已经跟不上实时**，
 > 而且实测识别结果并不比 50 MB 的 `small-bilingual` 更好。体积大 ≠ 更准。
+>
+> `x-asr` 的 RTF 用短测试音频测得 **0.90**（能跟上），但在 223 秒的真实电视剧
+> 音频上是 **1.15（略慢于实时）**——长音频上会慢慢落后。它是「单模型 + 自带标点」
+> 方案（见下节）要用的模型；纯追实时性仍推荐 `small-bilingual`。
 
 复现：
 
@@ -274,6 +279,45 @@ python3 dictation.py --model zh-14m --refine-model ""      # 关掉重识别，�
 python3 dictation.py --refine-model sense-voice            # 换 SenseVoice 做整句重识别
 ```
 
+### 另一条路：单模型的 final 模式
+
+两段式每句都要「流式出一遍 → 离线重跑一遍」，代价是句尾延迟、两套模型。
+还有一条只用**一个流式模型**的路子（`--commit final` + `--model x-asr`）：
+
+```
+音频 → 归一化 → 流式识别（一直吃连续音频，不切段、不重置）
+                        │  每个 token 自带时间戳
+                        ▼
+              「这段字连续 1 秒没被改写」→ 定型 → 凑成句 → 落盘
+```
+
+- **不切段、不重置**：识别器从头到尾吃同一条流，每句都有左上下文，
+  不会像 VAD 那样在每个边界丢字；
+- **定型靠局部一致性**：拿当前假设和 1 秒前的假设比公共前缀（跟 Whisper
+  streaming 的 local agreement 一个思路），没被改写的部分才算定型，
+  **提交过的文字不再修改**；
+- **标点来自模型**：`x-asr` 的词表里烤了标点和大小写，不用另挂标点模型，
+  VAD 也不需要。API 形态上就是一个模型。
+
+```sh
+python3 scripts/download_models.sh x-asr                 # 下载（155 MB）
+python3 dictation.py --commit final --model x-asr        # 单模型听写
+python3 dictation.py --commit final --model x-asr --source ws --port 8765
+```
+
+代价与边界（都实测过）：
+
+| | |
+|---|---|
+| **RTF** | 短音频 0.90（跟得上）；223s 真实电视剧音频 **1.15（略慢）**，长音频会慢慢落后 |
+| **长句** | 连续语音里 1 秒稳定就断句，30 秒兜底；`--final-margin` / `--final-pause` 可调 |
+| **换客户端** | ws/tcp 断开再接新客户端时，识别流会**收尾并重建**，上一条连接的残留不会串台 |
+| **断连尾字** | 断开时服务端补 0.5s 静音，逼出最后一句（跟 TCP 源一致） |
+
+> **默认仍是两段式**（`--commit vad`）。final 模式是「一个模型 + 自带标点」的
+> 干净方案，但 `x-asr` 体积大、长音频 RTF 略超 1；要极致实时就用默认的
+> `small-bilingual`。两条路都在，按场景选。
+
 ---
 
 ## 五、用法
@@ -297,8 +341,12 @@ python3 dictation.py --source tcp --port 8765            # 收别的机器推来
 
 | 参数 | 作用 |
 |---|---|
-| `--model` | 流式模型名或模型目录（`small-bilingual` / `bilingual` / `zh-14m` / `ctc-zh` / `paraformer-zh`） |
+| `--model` | 流式模型名或模型目录（`small-bilingual` / `bilingual` / `zh-14m` / `ctc-zh` / `paraformer-zh` / `x-asr`） |
 | `--refine-model` | 整句重识别用的非流式模型，空串关闭 |
+| `--commit` | 切句方式：`vad`（默认，VAD 切段 + 整句重识别）或 `final`（单模型 + 自带标点，见第四节） |
+| `--final-margin` | final 模式：假设连续多少秒没被改写就算定型，默认 1.0s |
+| `--final-pause` | final 模式：说话停顿多少秒断句，默认 1.2s |
+| `--final-max-sentence` | final 模式：单句最长多少秒强制断句，默认 30s |
 | `--source` | `ws` / `mic` / `file` / `stdin` / `pulse` / `tcp` |
 | `--file` `--realtime` | 听写文件；`--realtime` 按 1 倍速喂，用来验证实时链路 |
 | `--device` | `mic` 用 ALSA 设备名（`default`，多麦机器用 `plughw:1,0`）；`pulse` 用 PulseAudio 源名（`default` / `RDPSource`） |

@@ -44,6 +44,8 @@ class StreamingASR:
                 joiner=spec.joiner,
                 hotwords_file=hotwords,
                 modeling_unit=spec.modeling_unit,
+                bpe_vocab=spec.bpe_vocab,
+                model_type=spec.model_type,
                 **common,
             )
         if spec.kind == "ctc":
@@ -81,6 +83,14 @@ class StreamingASR:
 
     def is_endpoint(self, stream) -> bool:
         return self._recognizer.is_endpoint(stream)
+
+    def result_all(self, stream):
+        """带 token 和时间戳的结果。
+
+        ``timestamps[i]`` 是第 i 个 token 在音频里的**结束**时刻（秒）。
+        有了它就能判断「这段文字已经不会再变」——见 ``vd/final.py``。
+        """
+        return self._recognizer.get_result_all(stream)
 
 
 class OfflineASR:
