@@ -228,6 +228,28 @@ chunk；x-asr 的 token 还是子词级（`M`/`on`/`da`/`y`）。所以：
     落盘（但 `_mute_push=True`，不推给新客户端），再重建 committer。
   - **断连补静音**：ws 客户端断开时服务端补 0.5s 静音（`wsserver._TAIL_SILENCE`），
     逼出最后一句，跟 TCP 源一个道理。
+  - **调用链**（改这块先对一眼，`main` → `FinalEngine` → `FinalCommitter` → `StreamingASR`）：
+    ```
+    main() → FinalEngine.__init__              # dictation.py，--commit final 时
+                ├─ FinalCommitter(asr, sample_rate, margin, pause, max_sentence)
+                │     └─ asr.new_stream()                    # 开一条流
+                │  run(): for chunk in source.chunks():
+                │     ├─ _chunk(chunk)                       # 归一化
+                │     ├─ _commit.feed(chunk)                 # vd/final.py
+                │     │    ├─ asr.feed / asr.decode
+                │     │    └─ _collect()
+                │     │         ├─ _refresh() → asr.result_all(stream)
+                │     │         ├─ _stable_prefix(now)       # 跟 margin 秒前比
+                │     │         └─ _flush(now) → [Sentence]  # 标点/停顿/超长
+                │     ├─ term.partial / _push_partial        # 半句预览
+                │     └─ _emit(s) → _write() → writer/term/_push   # 晚一句落盘
+                ├─ _reset()        # source.session 变了：收尾旧连接 + 重建 committer
+                └─ finalize()      # _commit.finalize() 补静音逼尾字
+    ```
+    `FinalCommitter` 不 import 识别器，`asr` 是从构造参数注入的；它只用到
+    `new_stream` / `feed` / `decode` / `result_all` 四个方法。`FinalEngine` 与
+    默认的 `DictationEngine` 都继承 `ControlMixin`（`handle_control`：改名 / 续写）。
+    `_emit` 的晚一句缓冲在 `_held`，`finalize` / `_reset` 收尾时要把 `_held` 也写掉。
 
 ## 6. 改代码前先知道的坑
 

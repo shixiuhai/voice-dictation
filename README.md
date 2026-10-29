@@ -474,6 +474,7 @@ voice-dictation/
 │   ├── mic_client.html     浏览器控制台（getUserMedia → 16k s16le + 实时文字 + 配置）
 │   ├── capture_client.html 浏览器采音页（getDisplayMedia 系统音频 / 麦克风，分析用）
 │   ├── vad.py              Silero VAD 封装，切句
+│   ├── final.py            单模型 final 模式：定型判定 + 断句（FinalCommitter）
 │   ├── asr.py              流式 + 非流式识别封装（含 SenseVoice）
 │   ├── punct.py            标点恢复（CT-Transformer）
 │   ├── models.py           模型登记表与模型文件自动识别
@@ -496,9 +497,99 @@ voice-dictation/
 └── transcripts/            听写记录（不入库）
 ```
 
-音频源统一输出 16 kHz / 单声道 / float32，
-然后 **电平归一化 → VAD 切句 → 流式识别 →（可选）非流式重识别 →（可选）标点**。
-详见[第二节「识别原理与交互流程」](#二识别原理与交互流程)。
+音频源统一输出 16 kHz / 单声道 / float32。`main()` 按 `--commit` 二选一实例化引擎：
+
+- **`--commit vad`（默认，`DictationEngine`）**：电平归一化 → VAD 切句 →
+  流式识别 →（可选）非流式重识别 →（可选）标点。详见[第二节](#二识别原理与交互流程)。
+- **`--commit final`（`FinalEngine`）**：不切段，一条流吃到底 →（可选）电平归一化 →
+  `FinalCommitter` 定型/断句 → 落盘。详见[第四节「另一条路」](#另一条路单模型的-final-模式)。
+
+### 按功能职责归类（7 种）
+
+不看文件、不看分层，只按**「这个类在流程里干什么」**分，主要功能类落在 **7 种**职责里：
+
+| # | 功能职责 | 代表类 | 数量关系 |
+|---|---|---|---|
+| 1 | **识别**（音频 → 文字） | `StreamingASR`（流式出字）、`OfflineASR`（离线整句重识别） | 1~2 个 |
+| 2 | **切分**（文字 → 句子） | `FinalCommitter`（定型判定）、`SpeechVAD`（语音活动切段） | **二选一** |
+| 3 | **编排**（串流程） | `FinalEngine`、`DictationEngine` | **二选一** |
+| 4 | **音频源**（音频输入） | `AudioSource` 基类 + `AlsaMic`/`SoundDeviceMic`/`PulseSource`（麦克风）、`WavFile`（文件）、`RawStdin`（标准输入）、`TcpServer`/`WebSocketMic`（网络）；`LevelNormalizer`（电平归一化，严格说是处理不是源，常跟源一起用） | **多选一** |
+| 5 | **存储**（句子 → 文件） | `TranscriptWriter`（写 txt/md/srt/json，可追加）、`Segment`（存进记录的句子数据类）、`Sentence`（final 模式的定型句数据类，`vd/final.py`） | 1 套 |
+| 6 | **后处理**（文字润色） | `Punctuator`（挂标点模型）、`normalize_cjk_spacing()`（去中文间空格，是函数不是类） | 可选 |
+| 7 | **交互支撑**（外围） | `Terminal`（终端显示）、`ControlMixin`（浏览器改名/追加/列记录）、`models` 模块（模型解析/列出）、`NoCaptureDevice`（异常） | 外围 |
+
+**切分和编排是成对选的**，两条路各自配一套：
+
+```
+--commit vad（默认）     →  DictationEngine（编排） + SpeechVAD（切分）
+--commit final           →  FinalEngine（编排）     + FinalCommitter（切分）
+```
+
+一句话记忆：**主流程 4 类** —— 识别（出字）→ 切分（断句）→ 编排（串起来）→ 存储（落盘）；
+**外围 3 类** —— 音频源（进）→ 后处理（润色）→ 交互支撑（显示/控制/模型管理）。
+
+> **别把「7 种功能」和「3 层」混为一谈**：3 层说的是**抽象层次**
+> （`dictation.py` 编排 → `vd/` 能力模块 → sherpa-onnx），7 种说的是**功能职责**。
+> 一个职责可能横跨多层，一层里也可能有多种职责。
+>
+> 剩下几个类不属于这 7 种「功能类」，是纯数据载体或服务端管道：
+> `ModelSpec`（模型元数据）、`Segment`（`vad.py` 的语音段）、`MicWebServer` + `_Client`
+> （浏览器 WS/HTTP 服务端，见下一节）。
+
+### 按文件与面向对象归类
+
+再换个视角：9 个 Python 文件、26 个类，**按文件**看，每个文件一类职责；
+**按 OO 角色**看，每个类要么是「抽象/策略」，要么是「数据」，要么是「第三方库的薄封装」：
+
+| 功能类别 | 文件 | 类（数） | 说明 |
+|---|---|---|---|
+| **输入 / 音频** | `vd/audio.py` | `AudioSource`（基类）+ `AlsaMic` `SoundDeviceMic` `WebSocketMic` `TcpServer` `PulseSource` `WavFile` `RawStdin`（7 个实现）+ `LevelNormalizer` | 抽象基类定接口（只强约束 `chunks()`），7 个策略对应 7 种音源，`LevelNormalizer` 是可插拔的电平归一化（装饰器式） |
+| **识别 / 切句** | `vd/asr.py` `vd/vad.py` `vd/punct.py` | `StreamingASR` `OfflineASR` / `SpeechVAD`（+`Segment`）/ `Punctuator` | 对 sherpa-onnx 的薄封装（外观模式），把 C++ API 收成 `new_stream/feed/decode`、`accept/pop_segment`、`add` 几个方法 |
+| **切句策略（final）** | `vd/final.py` | `Sentence`（数据类）+ `FinalCommitter` | **纯算法，不 import 识别器**：定型判定（局部一致性）与断句。识别器由构造参数注入 |
+| **编排（引擎）** | `dictation.py` | `ControlMixin`（Mixin）+ `DictationEngine` `FinalEngine` + `NoCaptureDevice`（异常） | 两个引擎同构（`run/finalize/_emit/_write`），`--commit` 二选一；`ControlMixin` 是浏览器控制指令（改名/续写）的共用逻辑 |
+| **输出 / 落盘** | `vd/session.py` | `Segment`（数据类）+ `TranscriptWriter` + `Terminal` | `TranscriptWriter` 负责 txt/md/srt/json 四格式实时落盘；`Terminal` 负责实时显示 |
+| **服务端 / 配置** | `vd/wsserver.py` `vd/models.py` | `MicWebServer`（+`_Client`）/ `ModelSpec` | `MicWebServer` 手搓的 WS+HTTP 服务端（无第三方依赖）；`ModelSpec` 是模型元数据的数据类 |
+
+按面向对象角色归类：
+
+| OO 角色 | 类 |
+|---|---|
+| **抽象基类 / 接口** | `AudioSource` |
+| **策略（Strategy）** | 7 个 `*Mic` / `TcpServer` / `WavFile` / `RawStdin`；`DictationEngine` vs `FinalEngine` |
+| **装配 / 模板方法** | `DictationEngine`、`FinalEngine`（`main()` 是唯一装配点） |
+| **Mixin（共用行为）** | `ControlMixin` |
+| **外观 / 第三方封装** | `StreamingASR`、`OfflineASR`、`SpeechVAD`、`Punctuator` |
+| **可插拔组件（可选）** | `LevelNormalizer`、`Punctuator`（可 `None`） |
+| **数据对象（dataclass）** | `ModelSpec`、`Sentence`、`Segment`（`session.py`）、`Segment`（`vad.py`） |
+| **输出端点** | `TranscriptWriter`、`Terminal` |
+| **服务端** | `MicWebServer`（+ 内部 `_Client`，下划线开头不外露） |
+| **纯算法（无依赖）** | `FinalCommitter` |
+
+> 全项目**没有继承第三方基类**，唯一的继承关系是 `AudioSource` 的 7 个子类和
+> 两个引擎继承 `ControlMixin`。可变的东西（音源 / 模型 / 切句策略 / 是否标点 /
+> 是否归一化）全部走构造参数注入，所以每个类都能单独测。
+
+final 模式的调用链（`dictation.py` → `vd/final.py` → `vd/asr.py`）：
+
+```
+main()  →  FinalEngine(source, asr, writer, term, ...)      # dictation.py
+             │  FinalEngine.run():  for chunk in source.chunks()
+             │     ├─ _chunk(chunk)                 # 归一化
+             │     ├─ _commit.feed(chunk)  ───────┐ # FinalCommitter（vd/final.py）
+             │     │   ├─ asr.feed / asr.decode    │ # 一条永不重置的流
+             │     │   └─ _collect()               │
+             │     │       ├─ _refresh()  → asr.result_all(stream)
+             │     │       ├─ _stable_prefix(now)  # 与 margin 秒前假设比公共前缀
+             │     │       └─ _flush(now) → [Sentence]  # 句末标点 / 停顿 / 超长
+             │     │  返回 (pending 半句, [定稿句]) │
+             │     ├─ term.partial / _push_partial  # 预览
+             │     └─ for s: _emit(s)              # 晚一句落盘 → _write → writer/term/_push
+             ├─ _reset()   # source.session 变了：收尾旧连接、重建 committer
+             └─ finalize() # 循环结束：_commit.finalize() 补静音逼出尾字
+```
+
+`FinalCommitter` 不直接 `import` 识别器，而是通过构造参数拿到 `asr`
+（`StreamingASR`）调用 `new_stream()` / `feed()` / `decode()` / `result_all()`。
 
 ### ws 源的服务端结构
 
